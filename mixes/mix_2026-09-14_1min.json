@@ -1,0 +1,62 @@
+{
+  "path": "mixes/mix_2026-09-14_1min.flac",
+  "minutes": 1.0,
+  "actual_seconds": 81.06,
+  "style": "deep house",
+  "bpm_start": 118.67182122056201,
+  "bpm_end": 118,
+  "loop_bars": 16,
+  "xfade_bars": 4,
+  "steps": 25,
+  "seed": 1,
+  "slots": [
+    {
+      "index": 0,
+      "style": "deep house",
+      "bpm": 118.67182122056201,
+      "key": "C minor",
+      "camelot": "5A",
+      "variant": "warm analog bassline, lush pads, shuffling hi-hats, Rhodes chords",
+      "seed": 1,
+      "gen_seconds": 38.36,
+      "loop_bars": 16,
+      "path": "loops/deep-house_5a_119_1.flac",
+      "detected_bpm": 119.0135,
+      "stretch_rate": 0.9971,
+      "padded_samples": 0.0,
+      "padded_seconds": 0.0
+    },
+    {
+      "index": 1,
+      "style": "deep house",
+      "bpm": 118.4000851145909,
+      "key": "C minor",
+      "camelot": "5A",
+      "variant": "deep sub bass, filtered disco strings, groovy bassline, soft claps",
+      "seed": 2,
+      "gen_seconds": 38.43,
+      "loop_bars": 16,
+      "path": "loops/deep-house_5a_118_2.flac",
+      "detected_bpm": 117.9824,
+      "stretch_rate": 1.0035,
+      "padded_samples": 0.0,
+      "padded_seconds": 0.0
+    },
+    {
+      "index": 2,
+      "style": "deep house",
+      "bpm": 118.12772535610114,
+      "key": "C minor",
+      "camelot": "5A",
+      "variant": "dubby chords, swung percussion, organic house groove, congas",
+      "seed": 3,
+      "gen_seconds": 38.51,
+      "loop_bars": 16,
+      "path": "loops/deep-house_5a_118_3.flac",
+      "detected_bpm": 117.953,
+      "stretch_rate": 1.0015,
+      "padded_samples": 0.0,
+      "padded_seconds": 0.0
+    }
+  ]
+}
