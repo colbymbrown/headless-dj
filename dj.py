@@ -365,7 +365,10 @@ def main():
     args = ap.parse_args()
 
     if args.seed is None:
-        args.seed = int(dt.date.today().strftime("%Y%m%d"))
+        # No fixed seed: stamp the run with the current wallclock time so every
+        # generation differs (variety over reproducibility). Pass --seed to
+        # override and reproduce a specific mix.
+        args.seed = int(dt.datetime.now().timestamp() * 1_000_000)
     if args.style and args.style not in STYLES:
         raise SystemExit(f"unknown style {args.style!r}; try: {', '.join(sorted(STYLES))}")
     if args.xfade_bars >= args.loop_bars:
