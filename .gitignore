@@ -1,0 +1,4 @@
+
+# gene pool state (votes/plays/evolution) is runtime data, not code;
+# keep it local so the cron's reset --hard doesn't wipe votes.
+gene_pool.json
