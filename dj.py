@@ -12,6 +12,7 @@ bar-length bass-swap crossfade. Fades in from and out to silence.
 import argparse
 import datetime as dt
 import json
+import warnings
 import random
 import re
 import sys
@@ -23,6 +24,15 @@ import soundfile as sf
 
 import mix
 import genes
+
+# Ignore the benign float64-epsilon time-boundary warnings from
+# torchsde's Brownian sampler (tb=0.29999998 vs t0=0.3 at the
+# final diffusion step) -- purely cosmetic, not an error.
+warnings.filterwarnings(
+    "ignore",
+    message=r"Should have t\S*=t0",
+    category=UserWarning,
+)
 
 SR = mix.SR
 MODEL_ID = "stabilityai/stable-audio-open-1.0"
@@ -135,8 +145,11 @@ def make_plan(args):
     trial = genes.pick_trial(pool["genes"], rng, contains=args.style)
     bpm_lo, bpm_hi = trial["bpm_lo"], trial["bpm_hi"]
 
-    bpm0 = rng.uniform(bpm_lo, bpm_hi - 2) if args.bpm is None else args.bpm
-    bpm1 = min(bpm_hi, max(bpm_lo, bpm0 + rng.choice([-4, -3, 3, 4]))) if args.bpm is None else bpm0
+    # Fixed tempo for the whole mix, drawn at random from the gene's range.
+    # A single constant BPM (rather than progressive drift) is what produces
+    # the cleanest blends; keep bpm0 as that tempo, bpm1 == bpm0 for compat.
+    bpm0 = rng.uniform(bpm_lo, bpm_hi) if args.bpm is None else args.bpm
+    bpm1 = bpm0
     keys = _key_iter(rng, args.loops_per_key)
 
     target_s = args.minutes * 60.0
@@ -144,8 +157,7 @@ def make_plan(args):
     slots, total = [], 0.0
     i = 0
     while total < target_s:
-        p = min(1.0, total / target_s)
-        bpm = bpm0 + (bpm1 - bpm0) * p
+        bpm = bpm0  # every slot at the fixed tempo
         letter, num = next(keys)
         bar_s = mix.sec_per_bar(bpm)
         want = args.loop_bars * bar_s + preroll
@@ -362,7 +374,7 @@ def main():
     slots, bpm0, bpm1, pool, trial = make_plan(args)
     print(f"plan: {len(slots)} loops, gene #{trial['id']} (score {genes.score(trial):+d}, "
           f"{trial['plays']} plays): {trial['text']}")
-    print(f"{bpm0:.1f}->{bpm1:.1f} BPM, {args.loop_bars}-bar loops, "
+    print(f"{bpm0:.1f} BPM fixed, {args.loop_bars}-bar loops, "
           f"{args.xfade_bars}-bar blends")
 
     if args.plan_only:
