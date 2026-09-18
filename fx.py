@@ -38,7 +38,10 @@ DEFAULTS = {
     "rhythm_pool": {1.0: 3, 0.75: 2, 3.0: 1, 1.5: 2},
     "echo_wet": 0.75,
     "echo_feedback": 0.5,
+    "echo_decay_bars": 4.0,
     "reverb_wet": 0.40,
+    "reverb_input_bars": 2.0,
+    "reverb_tail_bars": 8.0,
     "reverb_room": 0.5,
     "reverb_ring_bars": 1.5,
     "build_bars": 8,
@@ -76,6 +79,27 @@ def _highpass_seg(seg):
     return np.asarray(
         Pedalboard([HighpassFilter(cutoff_frequency_hz=CROSSOVER_HZ)])(seg, SR),
         dtype=np.float32)
+
+
+def _ring_tail(effect, send, sr=SR, block=22050, noise_floor=1e-4):
+    """Send library-style: feed `send` into `effect` with reset=False (state
+    preserved), then keep flushing the effect with silence so its internal
+    feedback/decay keeps ringing out until it falls below the noise floor.
+    Returns the full wet output (dry-pass + tail)."""
+    wet = []
+    # feed the dry send in place (preserving effect state)
+    n = send.shape[0]
+    for j in range(0, n, block):
+        chunk = np.ascontiguousarray(send[j:j + block])
+        wet.append(effect.process(chunk, sr, reset=False))
+    # flush the ringing tail with silence
+    silence = np.zeros((block, send.shape[1]), dtype=np.float32)
+    for _ in range(64):
+        c = effect.process(silence, sr, reset=False)
+        wet.append(c)
+        if float(np.abs(c).max()) < noise_floor:
+            break
+    return np.concatenate(wet, axis=0)
 
 
 def fx(y, loops, bpms, slots, xfade_bars, cfg=None, seed=None, log=print):
@@ -154,26 +178,44 @@ def _echo(y, s, cfg, rng, bpm):
     mults = [m for m, _ in cfg["rhythm_pool"].items()]
     wts = [w for _, w in cfg["rhythm_pool"].items()]
     mult = rng.choices(mults, weights=wts, k=1)[0]
-    delay_sec = mult * beat
-    hp = _highpass_seg(seg)
-    board = Pedalboard([Delay(delay_seconds=min(delay_sec, 2.0),
-                              feedback=cfg["echo_feedback"])])
-    wet = np.asarray(board(hp, SR), dtype=np.float32)
-    wet = wet[:seg.shape[0]]
-    hp = hp[:seg.shape[0]]
+    delay_sec = max(0.02, min(mult * beat, 2.0))
+    hp = _highpass_seg(seg)  # bass-protected send
+    effect = Delay(delay_seconds=delay_sec, feedback=cfg["echo_feedback"], mix=1.0)
+    wet = _ring_tail(effect, hp)  # send + flush -> decaying taps
     out = y.copy()
-    out[start:s] = seg + cfg["echo_wet"] * wet
+    nseg = seg.shape[0]
+    # cap wet to what remains in the mix after start
+    wet = wet[: y.shape[0] - start]
+    # dry window: blend wet echo over the first nseg samples
+    m = min(nseg, wet.shape[0])
+    out[start:start + m] += cfg["echo_wet"] * wet[:m]
+    # trailing echo taps (feedback ring) extend past the dry window
+    if wet.shape[0] > nseg:
+        n_tail = min(wet.shape[0] - nseg, y.shape[0] - (start + nseg))
+        out[start + nseg:start + nseg + n_tail] += \
+            cfg["echo_wet"] * wet[nseg:nseg + n_tail]
     return out
 
 
 def _reverb(y, s, cfg, bar):
-    seg = y[s:s + int(cfg["reverb_ring_bars"] * bar)]
+    # Library send/return: send the material in the window right before s into
+    # the reverb (reset=False so state persists), then flush with silence so
+    # it rings out naturally. The wet signal is faded in over the first bar to
+    # smooth the onset and mixed back at wet_level as the return.
+    in_bars = max(0.5, cfg.get("reverb_input_bars", 2.0))
+    seg = y[max(0, s - int(in_bars * bar)):s]
     if seg.shape[0] < SR * 0.1:
         return None
     hp = _highpass_seg(seg)
-    board = Pedalboard([Reverb(room_size=cfg["reverb_room"],
-                               wet_level=cfg["reverb_wet"])])
-    wet = np.asarray(board(hp, SR), dtype=np.float32)
+    effect = Reverb(room_size=cfg["reverb_room"], wet_level=1.0, dry_level=0.0)
+    wet = _ring_tail(effect, hp)  # send + flush -> ringing tail
+    wet = wet[: y.shape[0] - s]
+    if wet.shape[0] == 0:
+        return None
+    # fade the wet in over the first bar to avoid an abrupt slam
+    fade_n = min(int(1.0 * bar), wet.shape[0])
+    if fade_n > 0:
+        wet[:fade_n] *= np.linspace(0.0, 1.0, fade_n)[:, None]
     out = y.copy()
     end = min(y.shape[0], s + wet.shape[0])
     out[s:end] += cfg["reverb_wet"] * wet[: end - s]
