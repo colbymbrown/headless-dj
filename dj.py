@@ -356,13 +356,13 @@ def main():
     ap.add_argument("--fade-bars", type=int, default=8)
     ap.add_argument("--loops-per-key", type=int, default=4)
     ap.add_argument("--steps", type=int, default=100, help="diffusion steps (25 fast, 100 default)")
-    ap.add_argument("--guidance", type=float, default=7.0)
+    ap.add_argument("--guidance", type=float, default=5.0)
     ap.add_argument("--loop-dbfs", type=float, default=-18.0)
     ap.add_argument("--out", default=None)
     ap.add_argument("--loops-dir", default="loops")
     ap.add_argument("--mix-only", action="store_true", help="reuse cached loops, no GPU")
     ap.add_argument("--no-cache", action="store_true")
-    ap.add_argument("--transform-strength", type=float, default=0.7,
+    ap.add_argument("--transform-strength", type=float, default=0.6,
                     help="0..1: each loop is a whole-loop transform of the previous "
                          "one instead of a fresh generation (0 = off). ~0.5-0.7 is a "
                          "good starting point.")
