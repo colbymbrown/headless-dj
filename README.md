@@ -107,3 +107,7 @@ in seconds without the model.
   Swap in `pyloudnorm` if level jumps ever bother you.
 - **Everything is held in RAM.** A 60 minute mix peaks around 3 GB. Fine here;
   stream to disk if this ever runs somewhere smaller.
+## Post-render FX + loudness
+
+See **docs_effect_plan.md** (on the  branch) for the plan to add DJ-style effects
+(filter sweep, echo-out, reverb, phaser) and LUFS/limiter loudness after the mix is rendered.
