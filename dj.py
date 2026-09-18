@@ -332,11 +332,9 @@ def build_mix(slots, args, out_path):
     y = mix.assemble(loops, bpms, args.xfade_bars)
     y = mix.fade_edges(y, SR, bpms[0], args.fade_bars, args.fade_bars)
     y = mix.finalize(y)
-    if getattr(args, "fx", False):
+    if not getattr(args, "no_fx", False):
         import fx
         cfg = fx.DEFAULTS
-        # keep the plain (un-effected) mix for A/B
-        sf.write(out_path.with_name(out_path.stem + "_plain.flac"), y, SR)
         y = fx.fx(y, loops, bpms, slots, args.xfade_bars, cfg=cfg)
         y = fx.loudness(y, cfg)
     sf.write(out_path, y, SR)
@@ -369,9 +367,9 @@ def main():
     ap.add_argument("--no-stretch", action="store_true",
                     help="trust the model's tempo instead of matching it (for A/B)")
     ap.add_argument("--plan-only", action="store_true")
-    ap.add_argument("--fx", action="store_true",
-                    help="apply the post-render DJ effects + loudness pass "
-                         "(see fx.py / docs_effect_plan.md)")
+    ap.add_argument("--no-fx", action="store_true",
+                    help="disable the post-render DJ effects + loudness pass "
+                         "(fx is ON by default; see fx.py / docs_effect_plan.md)")
     args = ap.parse_args()
 
     if args.seed is None:
