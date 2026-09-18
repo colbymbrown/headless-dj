@@ -355,7 +355,7 @@ def main():
     ap.add_argument("--loops-dir", default="loops")
     ap.add_argument("--mix-only", action="store_true", help="reuse cached loops, no GPU")
     ap.add_argument("--no-cache", action="store_true")
-    ap.add_argument("--transform-strength", type=float, default=0.0,
+    ap.add_argument("--transform-strength", type=float, default=0.7,
                     help="0..1: each loop is a whole-loop transform of the previous "
                          "one instead of a fresh generation (0 = off). ~0.5-0.7 is a "
                          "good starting point.")
