@@ -10,3 +10,4 @@ librosa
 numpy
 scipy
 pyrubberband
+pedalboard==0.9.14

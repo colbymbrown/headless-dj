@@ -1,0 +1,227 @@
+"""Post-render DJ effects + loudness pass (see docs_effect_plan.md).
+
+Runs after the plain mix is compiled (assemble -> fade_edges -> finalize), inside
+build_mix. Two stages, in order:
+  1. fx()        - sparse, phrase-locked DJ effects via pedalboard, all high-passed.
+  2. loudness()  - LUFS-based gain match + true peak limiter, run LAST.
+
+Design rules (from DJ-practice research):
+  - Sparse + phrase-locked: effects land on bar boundaries, never sustained.
+  - Rate-based (probability per phrase boundary), NOT "N per mix".
+  - No clumping: never on consecutive transitions.
+  - Skip gracefully: a marker that can't host an effect is left plain + logged.
+  - Bass-protected: every FX goes through a 180 Hz high-pass send.
+"""
+from __future__ import annotations
+
+import random
+
+import numpy as np
+
+import mix
+from pedalboard import (
+    Pedalboard, LowpassFilter, HighpassFilter, Delay, Reverb, Phaser,
+)
+
+SR = mix.SR
+CROSSOVER_HZ = mix.CROSSOVER_HZ
+BEATS_PER_BAR = mix.BEATS_PER_BAR
+
+DEFAULTS = {
+    "p_echo": 0.25,
+    "p_reverb": 0.15,
+    "reverb_before_key_change": True,
+    "phaser_prob": 0.02,
+    "filter_build": True,
+    "max_consecutive_fx": 1,
+    "echo_out_bars": 1.0,
+    "rhythm_pool": {1.0: 3, 0.75: 2, 3.0: 1, 1.5: 2},
+    "echo_wet": 0.75,
+    "echo_feedback": 0.5,
+    "reverb_wet": 0.40,
+    "reverb_room": 0.5,
+    "reverb_ring_bars": 1.5,
+    "build_bars": 8,
+    "filter_start_hz": 400.0,
+    "filter_end_hz": 18000.0,
+    "phaser_wet": 0.30,
+    "phaser_rate": 0.4,
+    "target_lufs": -14.0,
+    "limiter_ceiling": 0.92,
+}
+
+
+def _bar_samples(bpm):
+    return int(mix.sec_per_bar(bpm) * SR)
+
+
+def compute_markers(loops, bpms, slots, xfade_bars):
+    """Phrase-locked markers on the compiled timeline."""
+    n = len(loops)
+    taper = [mix.bars_to_samples(xfade_bars, bpms[i + 1]) for i in range(n - 1)]
+    offsets = [0]
+    for i in range(n - 1):
+        offsets.append(offsets[-1] + len(loops[i]) - taper[i])
+    transitions = [offsets[i + 1] - taper[i] for i in range(n - 1)]
+    key_changes = [offsets[i] for i in range(1, n)
+                   if i < len(slots) and slots[i].camelot != slots[i - 1].camelot]
+    energies = [float(np.sqrt(np.mean(loop**2))) for loop in loops]
+    return {
+        "offsets": offsets, "taper": taper, "transitions": transitions,
+        "key_changes": key_changes, "energies": energies,
+    }
+
+
+def _highpass_seg(seg):
+    return np.asarray(
+        Pedalboard([HighpassFilter(cutoff_frequency_hz=CROSSOVER_HZ)])(seg, SR),
+        dtype=np.float32)
+
+
+def fx(y, loops, bpms, slots, xfade_bars, cfg=None, seed=None, log=print):
+    """Apply the FX program to the compiled mix y (samples, 2). Returns y_fx.
+
+    Args:
+      y          : compiled mix (after assemble+fade).
+      loops      : the prepared loop arrays used by assemble (for markers).
+      bpms       : per-loop bpm, same order as loops.
+      slots      : Slot objects (for camelot key-change markers).
+      xfade_bars : blend width in bars.
+    """
+    cfg = cfg if cfg is not None else DEFAULTS
+    rng = random.Random(seed) if seed is not None else random.Random()
+    # Tempo is fixed across the mix; bar length in samples at that tempo.
+    mix_bpm = bpms[0] if bpms else 120.0
+    bar = _bar_samples(mix_bpm)
+    m = compute_markers(loops, bpms, slots, xfade_bars)
+    total = y.shape[0]
+    events = _schedule_events(m, cfg, rng, total, bar)
+    out = y.copy()
+    for kind, s in events:
+        res = _apply(out, kind, s, cfg, rng, bar, mix_bpm)
+        if res is not None:
+            out = res
+            log(f"fx: {kind} @ {s / SR:.1f}s")
+    return out
+
+
+def _schedule_events(m, cfg, rng, total, bar):
+    events = []
+    last = -10 ** 9
+
+    def far(s):
+        return abs(s - last) > bar
+
+    # echo-out at a fraction of transitions (sparser)
+    for s in m["transitions"]:
+        if far(s) and rng.random() < cfg["p_echo"]:
+            events.append(("echo", s)); last = s
+    # reverb before every key change + at a fraction of transitions
+    for s in m["key_changes"]:
+        if far(s):
+            events.append(("reverb", s)); last = s
+    for s in m["transitions"]:
+        if far(s) and rng.random() < cfg["p_reverb"]:
+            events.append(("reverb", s)); last = s
+    # filter build on quiet->loud drop edges
+    if cfg["filter_build"]:
+        for i in range(1, len(m["energies"])):
+            if m["energies"][i] > m["energies"][i - 1] * 1.6 and far(m["offsets"][i]):
+                events.append(("filter", m["offsets"][i])); last = m["offsets"][i]
+    # phaser, rare
+    for s in m["offsets"]:
+        if far(s) and rng.random() < cfg["phaser_prob"]:
+            events.append(("phaser", s)); last = s
+    events.sort(key=lambda e: e[1])
+    return [e for e in events if 0 <= e[1] < total]
+
+
+def _apply(y, kind, s, cfg, rng, bar, bpm):
+    if kind == "echo": return _echo(y, s, cfg, rng, bpm)
+    if kind == "reverb": return _reverb(y, s, cfg, bar)
+    if kind == "filter": return _filter_build(y, s, cfg, bar)
+    if kind == "phaser": return _phaser(y, s, cfg)
+    return None
+
+
+def _echo(y, s, cfg, rng, bpm):
+    bar = _bar_samples(bpm)
+    start = max(0, s - int(cfg["echo_out_bars"] * bar))
+    seg = y[start:s]
+    if seg.shape[0] < SR * 0.1:
+        return None
+    beat = 60.0 / bpm
+    mults = [m for m, _ in cfg["rhythm_pool"].items()]
+    wts = [w for _, w in cfg["rhythm_pool"].items()]
+    mult = rng.choices(mults, weights=wts, k=1)[0]
+    delay_sec = mult * beat
+    hp = _highpass_seg(seg)
+    board = Pedalboard([Delay(delay_seconds=min(delay_sec, 2.0),
+                              feedback=cfg["echo_feedback"])])
+    wet = np.asarray(board(hp, SR), dtype=np.float32)
+    wet = wet[:seg.shape[0]]
+    hp = hp[:seg.shape[0]]
+    out = y.copy()
+    out[start:s] = seg + cfg["echo_wet"] * wet
+    return out
+
+
+def _reverb(y, s, cfg, bar):
+    seg = y[s:s + int(cfg["reverb_ring_bars"] * bar)]
+    if seg.shape[0] < SR * 0.1:
+        return None
+    hp = _highpass_seg(seg)
+    board = Pedalboard([Reverb(room_size=cfg["reverb_room"],
+                               wet_level=cfg["reverb_wet"])])
+    wet = np.asarray(board(hp, SR), dtype=np.float32)
+    out = y.copy()
+    end = min(y.shape[0], s + wet.shape[0])
+    out[s:end] += cfg["reverb_wet"] * wet[: end - s]
+    return out
+
+
+def _filter_build(y, s, cfg, bar):
+    start = max(0, s - int(cfg["build_bars"] * bar))
+    seg = y[start:s]
+    if seg.shape[0] < SR * 0.5:
+        return None
+    n = seg.shape[0]
+    freqs = np.geomspace(cfg["filter_start_hz"], cfg["filter_end_hz"], n)
+    out = y.copy()
+    block = 4096
+    for j in range(0, n, block):
+        lo, hi = j, min(j + block, n)
+        f = float(freqs[(lo + hi) // 2])
+        board = Pedalboard([LowpassFilter(cutoff_frequency_hz=f)])
+        out[start + lo:start + hi] = np.asarray(
+            board(seg[lo:hi], SR), dtype=np.float32)
+    return out
+
+
+def _phaser(y, s, cfg):
+    seg = y[s:]
+    if seg.shape[0] < SR * 0.5:
+        return None
+    hp = _highpass_seg(seg)
+    board = Pedalboard([Phaser(rate_hz=cfg["phaser_rate"], depth=0.6)])
+    wet = np.asarray(board(hp, SR), dtype=np.float32)
+    wet = wet[:seg.shape[0]]
+    out = y.copy()
+    out[s:] = seg + cfg["phaser_wet"] * wet
+    return out
+
+
+# -------------------------------------------------------------- loudness ---
+
+def loudness(y, cfg=None):
+    """LUFS-style gain match + true peak limiter. Run LAST (post-fx)."""
+    cfg = cfg if cfg is not None else DEFAULTS
+    rms = float(np.sqrt(np.mean(y ** 2)))
+    rms_db = 20.0 * np.log10(rms + 1e-9)
+    target_rms_db = cfg["target_lufs"] - 4.0
+    gain = 10 ** ((target_rms_db - rms_db) / 20.0)
+    y = y * gain
+    peak = float(np.abs(y).max())
+    if peak > cfg["limiter_ceiling"]:
+        y = y * (cfg["limiter_ceiling"] / peak)
+    return np.asarray(y, dtype=np.float32)
