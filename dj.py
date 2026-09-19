@@ -302,13 +302,16 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot, prev_prepared=N
     transform of the previous prepared loop instead of a fresh text-to-audio
     generation.
 
-    Silence gate: if more than --max-silence of the prepared (heard) loop is
-    below -45 dBFS, or the groove starts later than --max-intro (kickless
-    intro: the model sometimes ignores the NEGATIVE prompt), the loop is
-    rejected and regenerated with a bumped seed, up to --silence-attempts
-    tries; the least-bad try wins as fallback.
+    Quality gate: a loop is rejected + regenerated (bumped seed, up to
+    --silence-attempts tries; least-bad try wins as fallback) when ANY of:
+      - more than --max-silence of the prepared loop is below -45 dBFS,
+      - the groove starts later than --max-intro (kickless intro),
+      - the per-bar onset energy is lopsided across the two halves
+        (groove_balance outside [--groove-min, --groove-max]) -- catches
+        "beat for only half" that silence_fraction misses (a pad at
+        -30 dBFS has no transient energy to flag it).
     """
-    best = None  # ((intro, frac), seed): non-intro loops preferred, then least silent
+    best = None  # ((intro, frac, bal_bad), seed): all false preferred
     for attempt in range(max(1, args.silence_attempts)):
         path = loop_path(slot, loops_dir, args)
         slot.path = str(path)
@@ -332,18 +335,22 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot, prev_prepared=N
                                       align_ref=prev_prepared)
         frac = mix.silence_fraction(loop, SR)
         intro = info.get("first_beat_s") or 0.0
-        score = (intro > args.max_intro, frac)
+        bal = mix.groove_balance(loop, SR, slot.bpm, args.loop_bars)
+        bal_bad = (bal < args.groove_min or bal > args.groove_max)
+        score = (intro > args.max_intro, frac, bal_bad)
         if best is None or score < best[0]:
             best = (score, slot.seed)
-        if frac <= args.max_silence and intro <= args.max_intro:
+        if frac <= args.max_silence and intro <= args.max_intro and not bal_bad:
             return path, not fresh, loop
+        reasons = []
         if intro > args.max_intro:
-            print(f"  ! [{slot.index}] rejected: {intro:.1f}s kickless intro "
-                  f"(> {args.max_intro:.0f}s), retrying with seed {slot.seed + 100000}",
-                  flush=True)
-        else:
-            print(f"  ! [{slot.index}] rejected: {frac:.0%} silent (> {args.max_silence:.0%}), "
-                  f"retrying with seed {slot.seed + 100000}", flush=True)
+            reasons.append(f"{intro:.1f}s kickless intro")
+        if frac > args.max_silence:
+            reasons.append(f"{frac:.0%} silent")
+        if bal_bad:
+            reasons.append(f"groove balance {bal:.2f}")
+        print(f"  ! [{slot.index}] rejected: {', '.join(reasons)}, "
+              f"retrying with seed {slot.seed + 100000}", flush=True)
         slot.seed += 100000
     # exhausted attempts: fall back to the least-bad version
     slot.seed = best[1]
@@ -444,6 +451,12 @@ def main():
                          "later than this many seconds in (kickless intro; "
                          "0 disables)")
     ap.add_argument("--silence-attempts", type=int, default=3)
+    ap.add_argument("--groove-min", type=float, default=0.5,
+                    help="reject loops whose first-half / second-half per-bar "
+                         "onset energy ratio falls below this (kickless intro) "
+                         "or above --groove-max (beat drops out into a "
+                         "breakdown/pad after 8 bars)")
+    ap.add_argument("--groove-max", type=float, default=2.0)
     ap.add_argument("--transform-strength", type=float, default=0.6,
                     help="0..1: each loop is a whole-loop transform of the previous "
                          "one instead of a fresh generation (0 = off). ~0.5-0.7 is a "

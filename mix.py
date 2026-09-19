@@ -371,6 +371,29 @@ def silence_fraction(loop, sr, thresh_dbfs=-45.0, win_s=0.05):
     return float((rms < 10 ** (thresh_dbfs / 20.0)).mean())
 
 
+def groove_balance(loop, sr, bpm, bars=16):
+    """Ratio of per-bar onset energy in the first half of the loop to the
+    second half. A sustained groove sits near 1.0; a kickless intro ~0.5;
+    a groove that drops out into a breakdown/pad after 8 bars -> infinity.
+    Detects the "beat for only half" failure that silence_fraction misses
+    (a pad at -30 dBFS slips past RMS but has no transient energy)."""
+    import librosa
+    hop = 512
+    mono = _mono(loop)
+    oenv = librosa.onset.onset_strength(y=mono, sr=sr, hop_length=hop)
+    bar_frames = max(1, int(sec_per_bar(bpm) * sr / hop))
+    nbars = len(oenv) // bar_frames
+    if nbars < bars:
+        return 1.0  # too short to judge; leave to other gates
+    pe = oenv[:nbars * bar_frames].reshape(nbars, bar_frames).sum(1)
+    h = nbars // 2
+    a = float(pe[:h].mean())
+    b = float(pe[h:].mean())
+    if b <= 1e-9:
+        return float("inf") if a > 1e-9 else 1.0
+    return a / b
+
+
 # ------------------------------------------------------------------ mixing ---
 
 def rms_normalize(y, target_dbfs=-18.0, peak_ceiling=0.95):
