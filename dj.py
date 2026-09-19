@@ -388,6 +388,20 @@ def build_mix(slots, args, out_path):
     if not getattr(args, "no_fx", False):
         import fx
         y = fx.fx(y, loops, bpms, slots, args.xfade_bars)
+    # planned tempo drift: varispeed the finished mix (vinyl-style).
+    # Applied after fx so constant-tempo beatmatching is never disturbed,
+    # before loudness so the master chain sees the final length.
+    if args.drift_pct > 0:
+        import random as _r
+        rng = _r.Random(args.seed ^ 0x9E3779B1)
+        d = args.drift_pct / 100.0
+        r0 = 1.0 + rng.uniform(-d, d)
+        r1 = 1.0 + rng.uniform(-d, d)
+        y = mix.varispeed(y, SR, r0, r1)
+        print(f"drift: {r0:.4f} -> {r1:.4f} ({(r0-1)*100:+.2f}% -> "
+              f"{(r1-1)*100:+.2f}%)", flush=True)
+    if not getattr(args, "no_fx", False):
+        import fx
         y = fx.loudness(y)
     if args.lowcut > 0 or args.highcut > 0:
         print(f"band limiting: low cut {args.lowcut or 'off'} Hz, "
@@ -447,6 +461,12 @@ def main():
     ap.add_argument("--no-fx", action="store_true",
                     help="disable the post-render DJ effects + loudness pass "
                          "(fx is ON by default; see fx.py)")
+    ap.add_argument("--drift-pct", type=float, default=2.0,
+                    help="planned varispeed drift over the mix length: the "
+                         "playhead rate ramps from a random start to a random "
+                         "end within +/- this percent (0 disables; vinyl-style "
+                         "tempo+pitch drift, applied post-fx so beatmatching "
+                         "is never disturbed)")
     args = ap.parse_args()
 
     if args.seed is None:

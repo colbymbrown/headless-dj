@@ -205,8 +205,9 @@ def _chain_start(parent, child, sr, bpm, loop_bars):
 
 
 def resample_time(y, rate):
-    """Constant-rate tempo change via linear resampling (pitch preserved).
-    Used only as a fallback when beat tracking finds nothing."""
+    """Constant-rate tempo change via linear resampling (varispeed: pitch
+    moves with tempo, vinyl-style). Used for per-loop stretch and as a
+    fallback when beat tracking finds nothing."""
     if abs(rate - 1.0) < 0.005:
         return y
     n = int(len(y) / rate)
@@ -214,6 +215,24 @@ def resample_time(y, rate):
     x = np.arange(len(y))
     return np.column_stack(
         [np.interp(t, x, y[:, c]) for c in range(y.shape[1])]
+    ).astype(np.float32)
+
+
+def varispeed(y, sr, r0, r1):
+    """Time-varying varispeed: playhead rate ramps linearly from r0 to r1
+    over the input. Pitch + tempo move together (vinyl deck feel).
+    Applied post-fx so constant-tempo beatmatching is never disturbed."""
+    if abs(r0 - 1.0) < 1e-4 and abs(r1 - 1.0) < 1e-4:
+        return y
+    n_in = y.shape[0]
+    # input position at output sample o: r0*o + (r1-r0)*o^2/(2*L_out)
+    # with L_in = L_out*(r0+r1)/2  =>  L_out = 2*L_in/(r0+r1)
+    n_out = int(2 * n_in / (r0 + r1))
+    o = np.arange(n_out, dtype=np.float64)
+    in_pos = r0 * o + (r1 - r0) * o * o / (2.0 * n_out)
+    x = np.arange(n_in, dtype=np.float64)
+    return np.column_stack(
+        [np.interp(in_pos, x, y[:, c]) for c in range(y.shape[1])]
     ).astype(np.float32)
 
 
