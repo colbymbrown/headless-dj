@@ -426,7 +426,9 @@ def main():
                     help="only try genes whose prompt contains this substring")
     ap.add_argument("--bpm", type=float, default=None, help="fixed tempo (no drift)")
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--loop-bars", type=int, default=16)
+    ap.add_argument("--loop-bars", type=int, default=8,
+                    help="bars per loop (8 avoids the model's 8-bar-then-"
+                         "dead-8 dropout that 16-bar requests produce)")
     ap.add_argument("--xfade-bars", type=int, default=4)
     ap.add_argument("--fade-bars", type=int, default=8)
     ap.add_argument("--loops-per-key", type=int, default=4)
