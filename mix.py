@@ -105,6 +105,31 @@ def refine_beats(beats, oenv, hop):
     return np.asarray(out, dtype=float)
 
 
+def first_impulse_start(oenv, hop, sr, thresh_frac=0.5, max_search_s=2.0):
+    """Frame index of the first strong onset, or None.
+
+    For chained generations the downbeat sits near t=0 by construction: each
+    loop is an img2img transform of the previous one, which itself started on
+    its downbeat. So instead of voting for bar phase, scan from the start and
+    take the first onset that clears `thresh_frac` of the strongest onset in
+    the search window (the first strong impulse, not the loudest one).
+    """
+    n = min(len(oenv), int(max_search_s * sr / hop))
+    if n < 3:
+        return None
+    seg = oenv[:n]
+    peaks = [i for i in range(n) if (
+        (i == 0 or seg[i] >= seg[i - 1]) and
+        (i == n - 1 or seg[i] > seg[i + 1]) and seg[i] > 0)]
+    if not peaks:
+        return None
+    thresh = thresh_frac * seg[peaks].max()
+    for i in peaks:
+        if seg[i] >= thresh:
+            return i
+    return None
+
+
 def pick_downbeat(beats, oenv):
     """Index of the first beat on the strongest 4/4 phase.
 
@@ -159,7 +184,13 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True):
     used_stretch = False
 
     # Start the loop on the detected downbeat so blends phase-lock at the bar line.
-    start = int(pick_downbeat(beats, oenv) * hop) if len(beats) else 0
+    imp = first_impulse_start(oenv, hop, sr)
+    if imp is not None:
+        start = int(imp * hop)
+    elif len(beats):
+        start = int(pick_downbeat(beats, oenv) * hop)
+    else:
+        start = 0
     body = raw[start:]  # source audio from the downbeat on
 
     # Constant-tempo stretch, only when the rate is sane (else it's a tracker error)
