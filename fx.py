@@ -19,7 +19,8 @@ import random
 import numpy as np
 
 import mix
-from pedalboard import Pedalboard, HighpassFilter, Delay, Reverb, Phaser
+from pedalboard import (Pedalboard, HighpassFilter, Delay, Reverb, Phaser,
+                        Compressor, Limiter, Clipping)
 
 SR = mix.SR
 CROSSOVER_HZ = mix.CROSSOVER_HZ
@@ -37,10 +38,20 @@ DEFAULTS = {
     "reverb_wet": 0.28,
     "reverb_input_bars": 2.0,
     "reverb_room": 0.5,
+    "reverb_damping": 0.5,
+    "reverb_width": 1.0,
     "phaser_wet": 0.30,
     "phaser_rate": 0.4,
     "target_lufs": -14.0,
     "limiter_ceiling": 0.92,
+    "comp_threshold_db": -16.0,
+    "comp_ratio": 2.0,
+    "comp_attack_ms": 15.0,
+    "comp_release_ms": 250.0,
+    "limiter_threshold_db": -1.0,
+    "limiter_release_ms": 100.0,
+    "sat_threshold_db": -1.5,
+    "sat_wet": 0.08,
 }
 
 
@@ -68,6 +79,11 @@ def _highpass_seg(seg):
     return np.asarray(
         Pedalboard([HighpassFilter(cutoff_frequency_hz=CROSSOVER_HZ)])(seg, SR),
         dtype=np.float32)
+
+
+def _jitter(base, rng, frac, lo, hi):
+    """Vary `base` by +/-frac (uniform), clamped to [lo, hi]."""
+    return float(np.clip(base * (1.0 + rng.uniform(-frac, frac)), lo, hi))
 
 
 def _ring_tail(effect, send, sr=SR, block=22050, noise_floor=1e-4):
@@ -146,7 +162,7 @@ def _schedule_events(m, cfg, rng, total, bar):
 
 def _apply(y, kind, s, cfg, rng, bar, bpm):
     if kind == "echo": return _echo(y, s, cfg, rng, bpm)
-    if kind == "reverb": return _reverb(y, s, cfg, bar)
+    if kind == "reverb": return _reverb(y, s, cfg, rng, bar)
     if kind == "phaser": return _phaser(y, s, cfg)
     return None
 
@@ -180,17 +196,23 @@ def _echo(y, s, cfg, rng, bpm):
     return out
 
 
-def _reverb(y, s, cfg, bar):
+def _reverb(y, s, cfg, rng, bar):
     # Library send/return: send the material in the window right before s into
     # the reverb (reset=False so state persists), then flush with silence so
     # it rings out naturally. The wet signal is faded in over the first bar to
     # smooth the onset and mixed back at wet_level as the return.
-    in_bars = max(0.5, cfg.get("reverb_input_bars", 2.0))
+    # Params are jittered per hit so no two reverbs sound identical.
+    room = _jitter(cfg["reverb_room"], rng, 0.15, 0.1, 0.9)
+    damping = _jitter(cfg.get("reverb_damping", 0.5), rng, 0.3, 0.1, 0.9)
+    width = _jitter(cfg.get("reverb_width", 1.0), rng, 0.4, 0.1, 1.0)
+    wet_lvl = _jitter(cfg["reverb_wet"], rng, 0.3, 0.1, 0.5)
+    in_bars = _jitter(cfg.get("reverb_input_bars", 2.0), rng, 0.4, 1.0, 3.0)
     seg = y[max(0, s - int(in_bars * bar)):s]
     if seg.shape[0] < SR * 0.1:
         return None
     hp = _highpass_seg(seg)
-    effect = Reverb(room_size=cfg["reverb_room"], wet_level=1.0, dry_level=0.0)
+    effect = Reverb(room_size=room, damping=damping, width=width,
+                    wet_level=1.0, dry_level=0.0)
     wet = _ring_tail(effect, hp)  # send + flush -> ringing tail
     wet = wet[: y.shape[0] - s]
     if wet.shape[0] == 0:
@@ -201,7 +223,7 @@ def _reverb(y, s, cfg, bar):
         wet[:fade_n] *= np.linspace(0.0, 1.0, fade_n)[:, None]
     out = y.copy()
     end = min(y.shape[0], s + wet.shape[0])
-    out[s:end] += cfg["reverb_wet"] * wet[: end - s]
+    out[s:end] += wet_lvl * wet[: end - s]
     return out
 
 
@@ -221,13 +243,33 @@ def _phaser(y, s, cfg):
 # -------------------------------------------------------------- loudness ---
 
 def loudness(y, cfg=None):
-    """LUFS-style gain match + true peak limiter. Run LAST (post-fx)."""
+    """Master bus: gain match -> glue compressor -> true-peak limiter.
+    Run LAST (post-fx)."""
     cfg = cfg if cfg is not None else DEFAULTS
+    # 1. gain match to target loudness
     rms = float(np.sqrt(np.mean(y ** 2)))
     rms_db = 20.0 * np.log10(rms + 1e-9)
     target_rms_db = cfg["target_lufs"] - 4.0
     gain = 10 ** ((target_rms_db - rms_db) / 20.0)
     y = y * gain
+    # 2. glue compressor for cohesion
+    y = np.asarray(Compressor(
+        threshold_db=cfg["comp_threshold_db"],
+        ratio=cfg["comp_ratio"],
+        attack_ms=cfg["comp_attack_ms"],
+        release_ms=cfg["comp_release_ms"],
+    )(y, SR), dtype=np.float32)
+    # 3. true-peak brick-wall limiter
+    ceiling_db = 20.0 * np.log10(cfg["limiter_ceiling"] + 1e-9)
+    y = np.asarray(Limiter(
+        threshold_db=ceiling_db - cfg["limiter_threshold_db"],
+        release_ms=cfg["limiter_release_ms"],
+    )(y, SR), dtype=np.float32)
+    # 4. gentle parallel saturation for warmth (very low wet blend)
+    sat = np.asarray(Clipping(threshold_db=cfg["sat_threshold_db"])(y, SR),
+                     dtype=np.float32)
+    y = (1.0 - cfg["sat_wet"]) * y + cfg["sat_wet"] * sat
+    # safety clip
     peak = float(np.abs(y).max())
     if peak > cfg["limiter_ceiling"]:
         y = y * (cfg["limiter_ceiling"] / peak)
