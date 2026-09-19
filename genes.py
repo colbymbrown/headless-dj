@@ -74,15 +74,10 @@ def crossover(a, b, rng, gid):
 
 
 def mutate(text, rng):
-    """Replace one word with a random genre name from genres.txt."""
+    """Replace one clause with a random genre name from genres.txt."""
     genres = GENRES_FILE.read_text().splitlines()
     clauses = text.split(", ")
-    c = rng.randrange(len(clauses))
-    words = clauses[c].split()
-    if not words:
-        return text
-    words[rng.randrange(len(words))] = rng.choice(genres)
-    clauses[c] = " ".join(words)
+    clauses[rng.randrange(len(clauses))] = rng.choice(genres)
     return ", ".join(clauses)
 
 

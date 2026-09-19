@@ -26,7 +26,7 @@ def test_crossover_joins_parent_clauses():
     assert child["bpm_lo"] == (genes[0]["bpm_lo"] + genes[1]["bpm_lo"]) // 2
 
 
-def test_mutate_swaps_one_word_for_a_genre():
+def test_mutate_swaps_a_clause_for_a_genre():
     rng = random.Random(1)
     genres = set(G.GENRES_FILE.read_text().splitlines())
     text = "deep house, warm analog bassline, lush pads, shuffling hi-hats"
