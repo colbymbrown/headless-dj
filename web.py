@@ -4,8 +4,7 @@
   .venv/bin/python web.py            # http://localhost:8085
 
 One 👍/👎 per mix (in-memory, resets on restart). A vote credits the gene that
-generated the mix; when every gene has been tried at least once, the pool
-evolves automatically.
+generated the mix; every 5 votes the pool evolves and the next mix kicks off.
 """
 import json
 import re

@@ -1,7 +1,7 @@
 """Pure DSP for the DJ mixer. No torch here on purpose, so blends can be
 re-rendered from cached loops in seconds without touching the GPU."""
 import numpy as np
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfilt, sosfiltfilt
 
 SR = 44100
 BEATS_PER_BAR = 4
@@ -18,8 +18,8 @@ _MAX_STRETCH = 1.5   # e.g. detected 90 BPM when asked for 128 → ~43% stretch
 _MIN_STRETCH = 1.0 / _MAX_STRETCH  # ~0.67
 
 
-def sec_per_bar(bpm, beats_per_bar=BEATS_PER_BAR):
-    return beats_per_bar * 60.0 / bpm
+def sec_per_bar(bpm):
+    return BEATS_PER_BAR * 60.0 / bpm
 
 
 def bars_to_samples(bars, bpm, sr=SR):
@@ -79,47 +79,71 @@ def analyze_timing(mono, sr, target_bpm, hop=512):
     return refine_tempo(oenv, sr, hop, tempo, beats), beats, oenv, hop
 
 
-def refine_beats(beats, oenv, hop):
-    """Snap each beat frame to the nearest onset-envelope peak.
+def first_onset_time(oenv, hop, sr, thresh_frac=0.1, max_search_s=2.0):
+    """Sample offset of the first strong onset near t=0.
 
-    beat_track returns frames on the hop grid (11.6 ms at hop 512), which is
-    visible as anchor jitter when warping. Parabolic peak on the envelope
-    removes the grid quantization.
+    Diagnostic finding: Stable Audio starts its beat ~0.1s after t=0 and the
+    img2img chain preserves that offset — but a few generations start early.
+    Cutting every loop at ITS first onset (low threshold, so a soft filtered
+    kick still counts) normalizes phase across the chain.
     """
-    out = []
-    n = len(oenv)
-    for b in beats:
-        i = int(round(b))
-        lo, hi = max(0, i - 4), min(n, i + 5)
-        w = oenv[lo:hi]
-        if len(w) < 3:
-            out.append(b)
-            continue
-        k = lo + int(np.argmax(w))
-        if 1 <= k - lo < len(w) - 1:  # parabolic sub-frame peak
-            a, c0, c1 = w[k - lo - 1], w[k - lo], w[k - lo + 1]
-            denom = a - 2 * c0 + c1
-            if denom != 0:
-                k += 0.5 * (a - c1) / denom
-        out.append(k)
-    return np.asarray(out, dtype=float)
-
-
-def pick_downbeat(beats, oenv):
-    """Index of the first beat on the strongest 4/4 phase.
-
-    Real downbeats are detected by voting: sum the onset energy of every beat
-    at each beat-of-the-bar position and take the strongest. This is robust to
-    syncopated or breakdown sections that fool single-onset heuristics.
-    """
-    if len(beats) < 4:
+    n = min(len(oenv), int(max_search_s * sr / hop))
+    if n < 3:
         return 0
-    i = np.clip(beats.astype(int), 0, len(oenv) - 1)
-    e = oenv[i]
-    phases = np.arange(len(beats)) % 4
-    scores = [e[phases == p].sum() for p in range(4)]
-    p = int(np.argmax(scores))
-    return int(np.nonzero(phases == p)[0][0])
+    seg = oenv[:n]
+    mx = seg.max()
+    if mx <= 0:
+        return 0
+    peaks = [i for i in range(n) if (
+        (i == 0 or seg[i] >= seg[i - 1]) and (i == n - 1 or seg[i] > seg[i + 1]))]
+    for i in peaks:
+        if seg[i] >= thresh_frac * mx:
+            return int(i * hop)
+    return 0
+
+
+# BeatNet's beat TIMES are frame-accurate, but its downbeat PHASE proved
+# unreliable on generated material (systematically ~2 beats off on clicks,
+# inconsistent across an img2img chain) -- and measured kick grids are
+# near-perfect (468.2ms spacing, 1.4ms sd). So the mixer anchors on kicks.
+
+
+def kick_grid(mono, sr, bpm):
+    """(times, lock 0..1) of the dominant low-band onset grid.
+
+    ponytail: single 120 Hz band, strength-weighted phase cluster. Revisit if
+    a genre with syncopated kicks (breaks, DnB) joins the corpus.
+    """
+    low = np.abs(sosfilt(butter(4, 120.0 / (sr / 2), btype="low", output="sos"),
+                         mono))
+    d = np.maximum(np.diff(low), 0.0)
+    w = int(0.02 * sr)
+    k = np.hanning(w)
+    k /= k.sum()
+    d = np.convolve(d, k, "same")
+    pk = np.where((d[1:-1] > d[:-2]) & (d[1:-1] >= d[2:])
+                  & (d[1:-1] > 0.25 * d.max()))[0] + 1
+    if not len(pk):
+        return np.array([]), 0.0
+    period = 60.0 / bpm
+    t, s = pk / sr, d[pk]
+    # merge double triggers within half a beat
+    mt, ms = [t[0]], [s[0]]
+    for x, y in zip(t[1:], s[1:]):
+        if x - mt[-1] > 0.4 * period:
+            mt.append(x)
+            ms.append(y)
+        elif y > ms[-1]:
+            ms[-1] = y
+    t, s = np.asarray(mt), np.asarray(ms)
+    # keep the strongest phase cluster: kicks, not stray off-beat bass notes
+    best_m, best_score = None, -1.0
+    for c in t:
+        m = np.abs((t - c + period / 2) % period - period / 2) < 0.15 * period
+        if s[m].sum() > best_score:
+            best_m, best_score = m, s[m].sum()
+    return t[best_m], float(best_m.sum() / len(t))
+
 
 
 def resample_time(y, rate):
@@ -135,8 +159,17 @@ def resample_time(y, rate):
     ).astype(np.float32)
 
 
-def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True):
+def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True):
     """Raw generation -> exactly `loop_bars` of beat-locked audio.
+
+    align: True = kick-grid downbeat (trim at the first kick of the dominant
+    low-band onset grid), "onset" = first strong onset, False = t=0.
+
+    Kick-grid anchoring: an img2img chain drifts each child's groove by
+    ~0.1-0.3 beats, so per-loop trims must re-anchor to each loop's own grid.
+    The grid's first kick is the downbeat by chain construction (children start
+    on their parent's prepared downbeat) -- cutting on ANY grid kick kills the
+    flam; cutting on the first keeps bar phase chain-consistent.
 
     A single global tempo is fit to the whole loop, then the audio is stretched
     at that one constant rate via RubberBand (pitch-preserving, transient-aware)
@@ -152,14 +185,36 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True):
     import pyrubberband as prb
 
     mono = raw.mean(axis=1)
-    det_bpm, beats, oenv, hop = analyze_timing(mono, sr, target_bpm)
     desired_len = bars_to_samples(loop_bars, target_bpm, sr)
+    if not align:
+        # Chain-trust mode: no downbeat detection, no tempo correction. The
+        # raw generation starts on its parent's downbeat by construction, so
+        # trim at t=0 and cut to length; phase comes entirely from the chain.
+        out = raw[:desired_len]
+        padded = max(0, desired_len - len(out))
+        if padded:
+            out = np.pad(out, ((0, padded), (0, 0)))
+        return out.astype(np.float32), {
+            "detected_bpm": None, "stretch_rate": 1.0, "stretched": False,
+            "stretched": False, "padded_samples": padded,
+            "padded_seconds": round(padded / sr, 3),
+        }
+    det_bpm, beats, oenv, hop = analyze_timing(mono, sr, target_bpm)
     rate = target_bpm / det_bpm if (det_bpm and stretch) else 1.0
     padded = 0
     used_stretch = False
 
-    # Start the loop on the detected downbeat so blends phase-lock at the bar line.
-    start = int(pick_downbeat(beats, oenv) * hop) if len(beats) else 0
+    # Trim on the loop's own kick grid: phase-locks the blend no matter how
+    # far the transform chain drifted. The trim must land exactly on a kick
+    # onset; anything else flams.
+    if align == "onset":
+        start = first_onset_time(oenv, hop, sr)
+    else:
+        kicks, lock = kick_grid(mono, sr, det_bpm or target_bpm)
+        if not len(kicks):
+            raise SystemExit("no kick onsets found in loop; cannot beat-align "
+                             "(rerun with a bumped seed)")
+        start = int(kicks[0] * sr)
     body = raw[start:]  # source audio from the downbeat on
 
     # Constant-tempo stretch, only when the rate is sane (else it's a tracker error)
@@ -191,7 +246,7 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True):
         "detected_bpm": det_bpm,
         "stretch_rate": rate,
         "stretched": used_stretch,
-        "warped": used_stretch,  # alias for back-compat; we no longer per-beat warp
+        "kick_lock": round(lock, 3) if align is True else None,
         "padded_samples": padded,
         "padded_seconds": round(padded / sr, 3),
     }

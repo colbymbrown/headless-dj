@@ -88,33 +88,50 @@ def test_tempo_match_and_beat_alignment():
     loop, info = mix.prepare_loop(raw, mix.SR, target_bpm, bars)
     assert len(loop) == mix.bars_to_samples(bars, target_bpm)
     assert info["padded_samples"] == 0, info
-    assert info["warped"], info
+    assert info["stretched"], info
     assert abs(info["detected_bpm"] - src_bpm) < 0.2, info
 
     period = mix.sec_per_bar(target_bpm) * mix.SR / 4
     phase = (int(np.argmax(np.abs(loop[:, 0]))) % period) / period
-    assert min(phase, 1 - phase) < 0.02, phase
+    # 0.05 beat (~24ms) = BeatNet's 50fps frame grid; a misaligned downbeat
+    # would land ~0.25-0.5 away, not near 0
+    assert min(phase, 1 - phase) < 0.05, phase
     # no silent tail from over-trimming: the loop ends on real audio
     tail = loop[-int(0.5 * mix.SR):, 0]
     assert np.abs(tail).max() > 0.05 * np.abs(loop[:, 0]).max(), "silent tail"
 
 
-def test_downbeat_vote_picks_accented_phase():
-    """With accented downbeats, the loop must start on an accent."""
-    try:
-        import librosa  # noqa: F401
-    except ImportError:
-        print("skip test_downbeat_vote (no librosa)")
-        return
+def test_kick_grid_trims_on_kick():
+    """align=True must trim exactly on the (accented) kick grid."""
     raw = _click_loop(126.0, 20, accent=3.0)
-    mono = raw.mean(axis=1)
-    tempo, beats, oenv, hop = mix.analyze_timing(mono, mix.SR, 126.0)
-    beats = mix.refine_beats(beats, oenv, hop)
-    d = mix.pick_downbeat(beats, oenv)
-    assert d % 4 == 0, d
-    loop, _ = mix.prepare_loop(raw, mix.SR, 126.0, 16)
-    # first kick is an accent (3x) and sits at the very start of the loop
-    assert abs(loop[:2000, 0]).max() > 2.0 * abs(loop[2000:4000, 0]).max()
+    loop, info = mix.prepare_loop(raw, mix.SR, 126.0, 16)
+    assert info["kick_lock"] > 0.9, info
+    _assert_peak_on_beat(loop, 126.0)
+
+
+def test_kick_grid_ignores_offbeat_bass():
+    """Off-beat bass stabs must not steal the trim point from the kicks."""
+    raw = _click_loop(126.0, 20, accent=3.0)
+    mono = raw.mean(axis=1).copy()
+    beat = mix.sec_per_bar(126.0) / 4
+    tt = np.arange(2000) / mix.SR
+    bass = 0.6 * np.sin(2 * np.pi * 55 * tt).astype(np.float32)
+    for k in range(76):
+        i = int((k + 0.5) * beat * mix.SR)
+        mono[i:i + 2000] += bass
+    loop, info = mix.prepare_loop(np.stack([mono, mono], axis=1),
+                                  mix.SR, 126.0, 16)
+    assert info["kick_lock"] > 0.9, info
+    _assert_peak_on_beat(loop, 126.0)
+
+
+def _assert_peak_on_beat(loop, bpm):
+    """First-beat energy peak within 0.1 beat of the loop start (i.e. the
+    trim landed on the kick, not half a beat off on an off-beat bass stab)."""
+    period = int(mix.sec_per_bar(bpm) * mix.SR / 4)   # one beat
+    peak = int(np.argmax(np.abs(loop[:, 0])[:period]))
+    phase = peak / period
+    assert min(phase, 1 - phase) < 0.1, (peak, period)
 
 
 def _click_loop(bpm, bars, accent=1.0):

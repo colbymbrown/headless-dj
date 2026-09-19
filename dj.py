@@ -148,9 +148,8 @@ def make_plan(args):
 
     # Fixed tempo for the whole mix, drawn at random from the gene's range.
     # A single constant BPM (rather than progressive drift) is what produces
-    # the cleanest blends; keep bpm0 as that tempo, bpm1 == bpm0 for compat.
-    bpm0 = rng.uniform(bpm_lo, bpm_hi) if args.bpm is None else args.bpm
-    bpm1 = bpm0
+    # the cleanest blends.
+    bpm = rng.uniform(bpm_lo, bpm_hi) if args.bpm is None else args.bpm
     keys = _key_iter(rng, args.loops_per_key)
 
     target_s = args.minutes * 60.0
@@ -158,7 +157,6 @@ def make_plan(args):
     slots, total = [], 0.0
     i = 0
     while total < target_s:
-        bpm = bpm0  # every slot at the fixed tempo
         letter, num = next(keys)
         bar_s = mix.sec_per_bar(bpm)
         want = args.loop_bars * bar_s + preroll
@@ -189,7 +187,7 @@ def make_plan(args):
                 depth * math.sin(2 * math.pi * sl.index / period))), 3)
     for i in range(1, len(slots)):
         slots[i].prev_seed = slots[i - 1].seed
-    return slots, bpm0, bpm1, pool, trial
+    return slots, bpm, pool, trial
 
 
 def _key_iter(rng, loops_per_key):
@@ -313,7 +311,10 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot):
             gen = torch.Generator("cuda").manual_seed(slot.seed)
             if args.transform_strength > 0 and prev_slot is not None:
                 raw_prev, sr = sf.read(prev_slot.path, dtype="float32", always_2d=True)
-                cond, _ = mix.prepare_loop(raw_prev, sr, prev_slot.bpm, args.loop_bars)
+                cond, _ = mix.prepare_loop(raw_prev, sr, prev_slot.bpm, args.loop_bars,
+                                           stretch=not args.no_stretch,
+                                           align="onset" if args.onset_trim
+                                           else not args.no_align)
                 cond = mix.rms_normalize(cond)
                 wav = img2img_loop(pipe, torch, slot, args, cond)
             else:
@@ -352,7 +353,9 @@ def build_mix(slots, args, out_path):
         if sr != SR:
             raise SystemExit(f"{s.path}: expected {SR}Hz, got {sr}Hz")
         loop, info = mix.prepare_loop(raw, sr, s.bpm, args.loop_bars,
-                                      stretch=not args.no_stretch)
+                                      stretch=not args.no_stretch,
+                                      align="onset" if args.onset_trim
+                                      else not args.no_align)
         loops.append(mix.rms_normalize(loop, args.loop_dbfs))
         bpms.append(s.bpm)
         report.append({**asdict(s), **{k: (None if v is None else round(float(v), 4))
@@ -367,9 +370,8 @@ def build_mix(slots, args, out_path):
     y = mix.finalize(y)
     if not getattr(args, "no_fx", False):
         import fx
-        cfg = fx.DEFAULTS
-        y = fx.fx(y, loops, bpms, slots, args.xfade_bars, cfg=cfg)
-        y = fx.loudness(y, cfg)
+        y = fx.fx(y, loops, bpms, slots, args.xfade_bars)
+        y = fx.loudness(y)
     if args.lowcut > 0 or args.highcut > 0:
         print(f"band limiting: low cut {args.lowcut or 'off'} Hz, "
               f"high cut {args.highcut or 'off'} Hz", flush=True)
@@ -413,10 +415,17 @@ def main():
                          "good starting point.")
     ap.add_argument("--no-stretch", action="store_true",
                     help="trust the model's tempo instead of matching it (for A/B)")
+    ap.add_argument("--onset-trim", action="store_true",
+                    help="trim each loop at its first strong onset instead of "
+                         "the voted downbeat (normalizes Stable Audio's ~0.1s "
+                         "start offset across the chain)")
+    ap.add_argument("--no-align", action="store_true",
+                    help="disable downbeat detection: trim at t=0 and trust the "
+                         "transform chain for phase (for A/B; implies raw cuts)")
     ap.add_argument("--plan-only", action="store_true")
     ap.add_argument("--no-fx", action="store_true",
                     help="disable the post-render DJ effects + loudness pass "
-                         "(fx is ON by default; see fx.py / docs_effect_plan.md)")
+                         "(fx is ON by default; see fx.py)")
     args = ap.parse_args()
 
     if args.seed is None:
@@ -429,10 +438,10 @@ def main():
     if args.xfade_bars >= args.loop_bars:
         raise SystemExit("--xfade-bars must be smaller than --loop-bars")
 
-    slots, bpm0, bpm1, pool, trial = make_plan(args)
+    slots, bpm, pool, trial = make_plan(args)
     print(f"plan: {len(slots)} loops, gene #{trial['id']} (score {genes.score(trial):+d}, "
           f"{trial['plays']} plays): {trial['text']}")
-    print(f"{bpm0:.1f} BPM fixed, {args.loop_bars}-bar loops, "
+    print(f"{bpm:.1f} BPM fixed, {args.loop_bars}-bar loops, "
           f"{args.xfade_bars}-bar blends")
 
     if args.plan_only:
@@ -478,8 +487,7 @@ def main():
         "minutes": args.minutes,
         "actual_seconds": round(dur, 2),
         "gene": trial,
-        "bpm_start": bpm0,
-        "bpm_end": bpm1,
+        "bpm": bpm,
         "loop_bars": args.loop_bars,
         "xfade_bars": args.xfade_bars,
         "steps": args.steps,

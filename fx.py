@@ -1,4 +1,4 @@
-"""Post-render DJ effects + loudness pass (see docs_effect_plan.md).
+"""Post-render DJ effects + loudness pass.
 
 Runs after the plain mix is compiled (assemble -> fade_edges -> finalize), inside
 build_mix. Two stages, in order:
@@ -19,9 +19,7 @@ import random
 import numpy as np
 
 import mix
-from pedalboard import (
-    Pedalboard, LowpassFilter, HighpassFilter, Delay, Reverb, Phaser,
-)
+from pedalboard import Pedalboard, HighpassFilter, Delay, Reverb, Phaser
 
 SR = mix.SR
 CROSSOVER_HZ = mix.CROSSOVER_HZ
@@ -32,21 +30,13 @@ DEFAULTS = {
     "p_reverb": 0.15,
     "reverb_before_key_change": True,
     "phaser_prob": 0.02,
-    "filter_build": True,
-    "max_consecutive_fx": 1,
     "echo_out_bars": 1.0,
     "rhythm_pool": {1.0: 3, 0.75: 2, 3.0: 1, 1.5: 2},
     "echo_wet": 0.55,
     "echo_feedback": 0.5,
-    "echo_decay_bars": 4.0,
     "reverb_wet": 0.28,
     "reverb_input_bars": 2.0,
-    "reverb_tail_bars": 8.0,
     "reverb_room": 0.5,
-    "reverb_ring_bars": 1.5,
-    "build_bars": 8,
-    "filter_start_hz": 400.0,
-    "filter_end_hz": 18000.0,
     "phaser_wet": 0.30,
     "phaser_rate": 0.4,
     "target_lufs": -14.0,
@@ -68,10 +58,9 @@ def compute_markers(loops, bpms, slots, xfade_bars):
     transitions = [offsets[i + 1] - taper[i] for i in range(n - 1)]
     key_changes = [offsets[i] for i in range(1, n)
                    if i < len(slots) and slots[i].camelot != slots[i - 1].camelot]
-    energies = [float(np.sqrt(np.mean(loop**2))) for loop in loops]
     return {
         "offsets": offsets, "taper": taper, "transitions": transitions,
-        "key_changes": key_changes, "energies": energies,
+        "key_changes": key_changes,
     }
 
 
@@ -147,11 +136,6 @@ def _schedule_events(m, cfg, rng, total, bar):
     for s in m["transitions"]:
         if far(s) and rng.random() < cfg["p_reverb"]:
             events.append(("reverb", s)); last = s
-    # filter build on quiet->loud drop edges
-    if cfg["filter_build"]:
-        for i in range(1, len(m["energies"])):
-            if m["energies"][i] > m["energies"][i - 1] * 1.6 and far(m["offsets"][i]):
-                events.append(("filter", m["offsets"][i])); last = m["offsets"][i]
     # phaser, rare
     for s in m["offsets"]:
         if far(s) and rng.random() < cfg["phaser_prob"]:
@@ -163,7 +147,6 @@ def _schedule_events(m, cfg, rng, total, bar):
 def _apply(y, kind, s, cfg, rng, bar, bpm):
     if kind == "echo": return _echo(y, s, cfg, rng, bpm)
     if kind == "reverb": return _reverb(y, s, cfg, bar)
-    if kind == "filter": return _filter_build(y, s, cfg, bar)
     if kind == "phaser": return _phaser(y, s, cfg)
     return None
 
@@ -219,24 +202,6 @@ def _reverb(y, s, cfg, bar):
     out = y.copy()
     end = min(y.shape[0], s + wet.shape[0])
     out[s:end] += cfg["reverb_wet"] * wet[: end - s]
-    return out
-
-
-def _filter_build(y, s, cfg, bar):
-    start = max(0, s - int(cfg["build_bars"] * bar))
-    seg = y[start:s]
-    if seg.shape[0] < SR * 0.5:
-        return None
-    n = seg.shape[0]
-    freqs = np.geomspace(cfg["filter_start_hz"], cfg["filter_end_hz"], n)
-    out = y.copy()
-    block = 4096
-    for j in range(0, n, block):
-        lo, hi = j, min(j + block, n)
-        f = float(freqs[(lo + hi) // 2])
-        board = Pedalboard([LowpassFilter(cutoff_frequency_hz=f)])
-        out[start + lo:start + hi] = np.asarray(
-            board(seg[lo:hi], SR), dtype=np.float32)
     return out
 
 

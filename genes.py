@@ -34,9 +34,6 @@ def load():
         save(state)
         print(f"seeded {POOL_FILE} with {len(gene_list)} genes from dj.STYLES")
     state = json.loads(POOL_FILE.read_text())
-    if isinstance(state, list):  # pre-votes format: migrate, scores reset
-        state = {"votes": 0, "genes": state}
-        save(state)
     return state
 
 
