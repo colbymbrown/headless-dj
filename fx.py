@@ -202,11 +202,11 @@ def _reverb(y, s, cfg, rng, bar):
     # it rings out naturally. The wet signal is faded in over the first bar to
     # smooth the onset and mixed back at wet_level as the return.
     # Params are jittered per hit so no two reverbs sound identical.
-    room = _jitter(cfg["reverb_room"], rng, 0.15, 0.1, 0.9)
-    damping = _jitter(cfg.get("reverb_damping", 0.5), rng, 0.3, 0.1, 0.9)
-    width = _jitter(cfg.get("reverb_width", 1.0), rng, 0.4, 0.1, 1.0)
-    wet_lvl = _jitter(cfg["reverb_wet"], rng, 0.3, 0.1, 0.5)
-    in_bars = _jitter(cfg.get("reverb_input_bars", 2.0), rng, 0.4, 1.0, 3.0)
+    room = _jitter(cfg["reverb_room"], rng, 0.08, 0.1, 0.9)
+    damping = _jitter(cfg.get("reverb_damping", 0.5), rng, 0.15, 0.1, 0.9)
+    width = _jitter(cfg.get("reverb_width", 1.0), rng, 0.2, 0.1, 1.0)
+    wet_lvl = _jitter(cfg["reverb_wet"], rng, 0.15, 0.1, 0.5)
+    in_bars = _jitter(cfg.get("reverb_input_bars", 2.0), rng, 0.2, 1.0, 3.0)
     seg = y[max(0, s - int(in_bars * bar)):s]
     if seg.shape[0] < SR * 0.1:
         return None
