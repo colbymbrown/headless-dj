@@ -20,7 +20,7 @@ import numpy as np
 
 import mix
 from pedalboard import (Pedalboard, HighpassFilter, Delay, Reverb, Phaser,
-                        Compressor, Limiter, Clipping)
+                        Compressor, Limiter)
 
 SR = mix.SR
 CROSSOVER_HZ = mix.CROSSOVER_HZ
@@ -50,8 +50,6 @@ DEFAULTS = {
     "comp_release_ms": 250.0,
     "limiter_threshold_db": -1.0,
     "limiter_release_ms": 100.0,
-    "sat_threshold_db": -1.5,
-    "sat_wet": 0.08,
 }
 
 
@@ -265,10 +263,6 @@ def loudness(y, cfg=None):
         threshold_db=ceiling_db - cfg["limiter_threshold_db"],
         release_ms=cfg["limiter_release_ms"],
     )(y, SR), dtype=np.float32)
-    # 4. gentle parallel saturation for warmth (very low wet blend)
-    sat = np.asarray(Clipping(threshold_db=cfg["sat_threshold_db"])(y, SR),
-                     dtype=np.float32)
-    y = (1.0 - cfg["sat_wet"]) * y + cfg["sat_wet"] * sat
     # safety clip
     peak = float(np.abs(y).max())
     if peak > cfg["limiter_ceiling"]:
