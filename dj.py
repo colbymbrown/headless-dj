@@ -12,6 +12,7 @@ bar-length bass-swap crossfade. Fades in from and out to silence.
 import argparse
 import datetime as dt
 import json
+import math
 import warnings
 import random
 import re
@@ -38,7 +39,7 @@ SR = mix.SR
 MODEL_ID = "stabilityai/stable-audio-open-1.0"
 MAX_GEN_S = 47.0  # Stable Audio Open's hard limit
 NEGATIVE = ("vocals, singing, speech, voice, acapella, low quality, muffled, "
-            "noisy, distorted, silence")
+            "noisy, distorted, silence, intro, outro, drone, breakdown")
 
 # style -> (bpm range, prompt variants). Seed population for the gene pool
 # (genes.py): used only to create gene_pool.json on first run. After that the
@@ -124,13 +125,13 @@ class Slot:
     gen_seconds: float
     loop_bars: int
     prev_seed: int | None = None
+    strength: float | None = None
     path: str = ""
 
     @property
     def prompt(self):
         return (f"{int(round(self.bpm))} BPM loop, {self.gene_text}, "
-                f"key of {self.key}, four on the floor kick drum, stereo club mix, "
-                f"instrumental, high fidelity")
+                f"stereo club mix, instrumental")
 
 
 def slug(s):
@@ -177,6 +178,15 @@ def make_plan(args):
                   f"{MAX_GEN_S:.0f}s, generating {MAX_GEN_S:.0f}s", file=sys.stderr)
         total += (args.loop_bars - args.xfade_bars) * bar_s
         i += 1
+    # Slow LFO on the img2img transform strength: a sine with a 12-loop period
+    # and +-0.2 depth around --transform-strength. High points stay close to the
+    # previous loop (coherent), low points wander (fresh material), so the mix
+    # breathes instead of degenerating into one looping cell.
+    if args.transform_strength > 0:
+        period, depth = 12, 0.1
+        for sl in slots:
+            sl.strength = round(min(0.85, max(0.25, args.transform_strength +
+                depth * math.sin(2 * math.pi * sl.index / period))), 3)
     for i in range(1, len(slots)):
         slots[i].prev_seed = slots[i - 1].seed
     return slots, bpm0, bpm1, pool, trial
@@ -216,7 +226,8 @@ def loop_path(slot, loops_dir, args):
     --guidance and the transform strength + previous loop's seed: they all
     change the audio, so they are part of the cache key.
     """
-    xf = (f"_x{args.transform_strength:g}"
+    ts = slot.strength if slot.strength is not None else args.transform_strength
+    xf = (f"_x{ts:g}"
           + (f"p{slot.prev_seed}" if slot.prev_seed is not None else "")
           if args.transform_strength > 0 else "")
     return Path(loops_dir) / (
@@ -257,7 +268,8 @@ def img2img_loop(pipe, torch, slot, args, cond_loop):
 
     pipe.scheduler.set_timesteps(args.steps, device=device)
     timesteps = pipe.scheduler.timesteps
-    k = int(round(args.transform_strength * (len(timesteps) - 1)))
+    ts = slot.strength if slot.strength is not None else args.transform_strength
+    k = int(round(ts * (len(timesteps) - 1)))
     k = min(max(k, 0), len(timesteps) - 1)
     sigma_k = float(pipe.scheduler.sigmas[k])
     eps = torch.randn(enc_pad.shape, device=device, dtype=torch.float16, generator=gen)
@@ -287,26 +299,47 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot):
     With --transform-strength and a previous slot, the loop is a whole-loop
     transform of the previous prepared loop instead of a fresh text-to-audio
     generation.
-    """
-    path = loop_path(slot, loops_dir, args)
-    slot.path = str(path)
-    if path.exists() and not args.no_cache:
-        return path, True
 
-    gen = torch.Generator("cuda").manual_seed(slot.seed)
-    if args.transform_strength > 0 and prev_slot is not None:
-        raw_prev, sr = sf.read(prev_slot.path, dtype="float32", always_2d=True)
-        cond, _ = mix.prepare_loop(raw_prev, sr, prev_slot.bpm, args.loop_bars)
-        cond = mix.rms_normalize(cond)
-        wav = img2img_loop(pipe, torch, slot, args, cond)
-    else:
-        audio = pipe(slot.prompt, negative_prompt=NEGATIVE,
-                     num_inference_steps=args.steps,
-                     audio_end_in_s=slot.gen_seconds,
-                     guidance_scale=args.guidance, generator=gen).audios
-        wav = audio[0].T.float().cpu().numpy()
-    sf.write(path, wav, SR)
-    return path, False
+    Silence gate: if more than --max-silence of the prepared (heard) loop is
+    below -45 dBFS, the loop is rejected and regenerated with a bumped seed,
+    up to --silence-attempts tries; the least-silent try wins as fallback.
+    """
+    best = None  # (frac, seed) across attempts
+    for attempt in range(max(1, args.silence_attempts)):
+        path = loop_path(slot, loops_dir, args)
+        slot.path = str(path)
+        fresh = not (path.exists() and not args.no_cache)
+        if fresh:
+            gen = torch.Generator("cuda").manual_seed(slot.seed)
+            if args.transform_strength > 0 and prev_slot is not None:
+                raw_prev, sr = sf.read(prev_slot.path, dtype="float32", always_2d=True)
+                cond, _ = mix.prepare_loop(raw_prev, sr, prev_slot.bpm, args.loop_bars)
+                cond = mix.rms_normalize(cond)
+                wav = img2img_loop(pipe, torch, slot, args, cond)
+            else:
+                audio = pipe(slot.prompt, negative_prompt=NEGATIVE,
+                             num_inference_steps=args.steps,
+                             audio_end_in_s=slot.gen_seconds,
+                             guidance_scale=args.guidance, generator=gen).audios
+                wav = audio[0].T.float().cpu().numpy()
+            sf.write(path, wav, SR)
+        raw, sr = sf.read(path, dtype="float32", always_2d=True)
+        loop, _ = mix.prepare_loop(raw, sr, slot.bpm, args.loop_bars,
+                                   stretch=not args.no_stretch)
+        frac = mix.silence_fraction(loop, SR)
+        if best is None or frac < best[0]:
+            best = (frac, slot.seed)
+        if frac <= args.max_silence:
+            return path, not fresh
+        print(f"  ! [{slot.index}] rejected: {frac:.0%} silent (> {args.max_silence:.0%}), "
+              f"retrying with seed {slot.seed + 100000}", flush=True)
+        slot.seed += 100000
+    # exhausted attempts: fall back to the least-silent version
+    slot.seed = best[1]
+    slot.path = str(loop_path(slot, loops_dir, args))
+    print(f"  ! [{slot.index}] all {args.silence_attempts} attempts too silent; "
+          f"keeping best ({best[0]:.0%})", flush=True)
+    return slot.path, False
 
 
 # ------------------------------------------------------------------- mixin ---
@@ -354,12 +387,16 @@ def main():
     ap.add_argument("--fade-bars", type=int, default=8)
     ap.add_argument("--loops-per-key", type=int, default=4)
     ap.add_argument("--steps", type=int, default=100, help="diffusion steps (25 fast, 100 default)")
-    ap.add_argument("--guidance", type=float, default=5.0)
+    ap.add_argument("--guidance", type=float, default=7.0)
     ap.add_argument("--loop-dbfs", type=float, default=-18.0)
     ap.add_argument("--out", default=None)
     ap.add_argument("--loops-dir", default="loops")
     ap.add_argument("--mix-only", action="store_true", help="reuse cached loops, no GPU")
     ap.add_argument("--no-cache", action="store_true")
+    ap.add_argument("--max-silence", type=float, default=0.2,
+                    help="reject + regenerate a loop when more than this "
+                         "fraction of the heard loop is silent (0.2 = 20%%)")
+    ap.add_argument("--silence-attempts", type=int, default=3)
     ap.add_argument("--transform-strength", type=float, default=0.6,
                     help="0..1: each loop is a whole-loop transform of the previous "
                          "one instead of a fresh generation (0 = off). ~0.5-0.7 is a "
@@ -402,7 +439,7 @@ def main():
     loops_dir.mkdir(exist_ok=True)
     out_dir = Path("mixes")
     out_dir.mkdir(exist_ok=True)
-    stamp = dt.datetime.now().strftime("%Y-%m-%d")
+    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_path = Path(args.out) if args.out else out_dir / f"mix_{stamp}_{args.minutes:g}min.flac"
 
     t0 = time.time()

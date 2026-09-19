@@ -9,6 +9,9 @@ evolves automatically.
 """
 import json
 import re
+import subprocess
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -18,13 +21,48 @@ PORT = 8085  # 8080 is taken by llama-server on this machine
 MIXES = Path("mixes")
 VOTED = set()  # mix filenames already voted on this server session
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8"><title>headless-dj</title>
+# Vote -> evolve -> next mix: each fresh vote kicks off a new mix in a
+# background process (one GPU job at a time). Replaces the old daily cron.
+ROOT = Path(__file__).resolve().parent
+MIX_MINUTES = 30
+_gen_lock = threading.Lock()
+
+
+def kickoff_generation():
+    """Spawn `dj.py --minutes MIX_MINUTES` in a background thread + process.
+    Non-blocking: if a generation is already in flight, skip (one at a time)."""
+    def run():
+        if not _gen_lock.acquire(blocking=False):
+            print("[vote] generation skipped, one already in flight", flush=True)
+            return
+        try:
+            log = (ROOT / "mixes" / "vote-gen.log").open("a")
+            print(f"[vote] starting new {MIX_MINUTES}-min mix", flush=True)
+            proc = subprocess.Popen(
+                [sys.executable, "dj.py", "--minutes", str(MIX_MINUTES)],
+                cwd=ROOT, stdout=log, stderr=subprocess.STDOUT)
+            rc = proc.wait()
+            log.write(f"vote-triggered generation exited {rc}\n")
+            print(f"[vote] generation finished (exit {rc})", flush=True)
+        finally:
+            _gen_lock.release()
+    threading.Thread(target=run, daemon=True).start()
+
+PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>headless-dj</title>
 <style>
-body {{ font-family: sans-serif; max-width: 760px; margin: 2em auto; background: #111; color: #ddd; }}
+body {{ font-family: sans-serif; max-width: 760px; margin: 2em auto; padding: 0 12px; box-sizing: border-box; background: #111; color: #ddd; }}
 .row {{ display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #333; }}
 .row div {{ flex: 1; min-width: 0; }} audio {{ width: 340px; }}
-button {{ font-size: 1.3em; background: none; border: none; cursor: pointer; }}
-button:hover {{ transform: scale(1.2); }} small {{ color: #888; }}
+button {{ font-size: 1.6em; background: none; border: none; cursor: pointer; padding: 4px 10px; -webkit-tap-highlight-color: transparent; }}
+button:hover {{ transform: scale(1.2); }} small {{ color: #888; word-wrap: break-word; }}
+@media (max-width: 600px) {{
+  body {{ margin: 1em auto; }}
+  h1 {{ font-size: 1.4em; }}
+  .row {{ flex-wrap: wrap; }}
+  .row div {{ flex: 1 1 100%; }}
+  audio {{ flex: 2 1 200px; width: auto; min-width: 200px; }}
+  button {{ font-size: 2em; padding: 6px 14px; }}
+}}
 </style></head><body>
 <h1>headless-dj</h1>
 {rows}
@@ -131,7 +169,8 @@ class Handler(BaseHTTPRequestHandler):
                               "application/json")
         genes.vote(genes.load(), gene["id"], bool(data.get("up")))
         VOTED.add(mix_name)
-        msg = f"scored gene #{gene['id']}"
+        kickoff_generation()  # evolve -> next: start the next 30-min mix now
+        msg = f"scored gene #{gene['id']} · next mix generating"
         self._send(200, json.dumps({"msg": msg}).encode(), "application/json")
 
 

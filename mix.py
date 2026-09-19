@@ -197,6 +197,19 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True):
     }
 
 
+def silence_fraction(loop, sr, thresh_dbfs=-45.0, win_s=0.05):
+    """Fraction of short windows of the prepared (actually-heard) loop whose
+    RMS sits below thresh_dbfs. Loops with long dead stretches sound broken
+    when beat-locked into a mix, so dj.py rejects them."""
+    win = max(1, int(win_s * sr))
+    n = len(loop) // win * win
+    if n == 0:
+        return 1.0
+    frames = loop[:n].reshape(-1, win, loop.shape[1])
+    rms = np.sqrt((frames.astype(np.float64) ** 2).mean(axis=(1, 2)))
+    return float((rms < 10 ** (thresh_dbfs / 20.0)).mean())
+
+
 # ------------------------------------------------------------------ mixing ---
 
 def rms_normalize(y, target_dbfs=-18.0, peak_ceiling=0.95):
