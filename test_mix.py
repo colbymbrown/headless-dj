@@ -125,6 +125,22 @@ def test_kick_grid_ignores_offbeat_bass():
     _assert_peak_on_beat(loop, 126.0)
 
 
+def test_silence_fallback_tiles_shortest_clean_prefix():
+    """16 bars with a dead second half -> 8 clean bars tiled twice."""
+    raw = _click_loop(126.0, 8, accent=3.0)          # 8 bars of groove...
+    # + continuous floor: sparse clicks alone read as ~80% "silent" to the
+    # 50ms-window RMS metric (silent gaps between hits), real music isn't
+    rng = np.random.default_rng(0)
+    raw = raw + rng.normal(0, 0.05, raw.shape).astype(np.float32)
+    raw = np.concatenate([raw, np.zeros_like(raw)])  # ...then 8 bars of silence
+    loop, info = mix.prepare_loop(raw, mix.SR, 126.0, 16, max_silence=0.2)
+    assert info["tiled_bars"] == 8, info
+    half = mix.bars_to_samples(8, 126.0)
+    assert len(loop) == mix.bars_to_samples(16, 126.0)
+    assert np.allclose(loop[:half], loop[half:], atol=1e-6)
+    # (a fully-silent loop never reaches tiling: kick_grid raises first)
+
+
 def _assert_peak_on_beat(loop, bpm):
     """First-beat energy peak within 0.1 beat of the loop start (i.e. the
     trim landed on the kick, not half a beat off on an off-beat bass stab)."""

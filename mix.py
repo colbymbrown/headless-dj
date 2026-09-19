@@ -159,7 +159,8 @@ def resample_time(y, rate):
     ).astype(np.float32)
 
 
-def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True):
+def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True,
+                 max_silence=None):
     """Raw generation -> exactly `loop_bars` of beat-locked audio.
 
     align: True = kick-grid downbeat (trim at the first kick of the dominant
@@ -170,6 +171,12 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True):
     The grid's first kick is the downbeat by chain construction (children start
     on their parent's prepared downbeat) -- cutting on ANY grid kick kills the
     flam; cutting on the first keeps bar phase chain-consistent.
+
+    Silence fallback (max_silence): if the trimmed loop is more than this
+    fraction silent, tile the longest silence-free power-of-2 prefix instead
+    (16 -> 8 -> 4 -> 2 -> 1 bars, repeated to full length); info["tiled_bars"]
+    records what was used. If even 1 bar is silent the loop is returned as-is
+    and the caller's gate rejects it.
 
     A single global tempo is fit to the whole loop, then the audio is stretched
     at that one constant rate via RubberBand (pitch-preserving, transient-aware)
@@ -198,6 +205,7 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True):
             "detected_bpm": None, "stretch_rate": 1.0, "stretched": False,
             "stretched": False, "padded_samples": padded,
             "padded_seconds": round(padded / sr, 3),
+            "first_kick_s": 0.0,
         }
     det_bpm, beats, oenv, hop = analyze_timing(mono, sr, target_bpm)
     rate = target_bpm / det_bpm if (det_bpm and stretch) else 1.0
@@ -219,34 +227,51 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True):
 
     # Constant-tempo stretch, only when the rate is sane (else it's a tracker error)
     # and the clip is long enough that stretching won't run past its end.
+    full = None
     if (det_bpm is not None and len(beats) >= 8 and stretch
             and _MIN_STRETCH <= rate <= _MAX_STRETCH
             and len(body) >= int(desired_len / _MAX_STRETCH)):
         try:
             # pyrubberband takes (n, channels) directly — no transpose needed.
-            stretched = prb.time_stretch(body, sr, rate)
+            full = prb.time_stretch(body, sr, rate)
         except Exception:
-            stretched = None
-        if stretched is not None and len(stretched) >= desired_len:
-            out = stretched[:desired_len].astype(np.float32)
+            full = None
+        if full is not None and len(full) >= desired_len:
+            out = full[:desired_len].astype(np.float32)
             used_stretch = True
         else:
-            stretched = None
-    else:
-        stretched = None
+            full = None
 
-    if stretched is None:  # fallback: cheap resample, trim, zero-pad shortfall
-        resampled = resample_time(body, rate)
-        out = resampled[:desired_len]
-        padded = max(0, desired_len - len(out))
-        if padded:
-            out = np.pad(out, ((0, padded), (0, 0)))
+    if full is None:  # fallback: cheap resample, trim, zero-pad shortfall
+        full = resample_time(body, rate)
+        out = full[:desired_len]
+    padded = max(0, desired_len - len(out))
+    if padded:
+        out = np.pad(out, ((0, padded), (0, 0)))
+
+    # Silence fallback: tile the longest silence-free power-of-2 prefix
+    # (16 -> 8 -> 4 -> 2 -> 1 bars) to full length rather than ship a loop
+    # with a dead stretch.
+    tiled = None
+    if max_silence is not None and silence_fraction(out, sr) > max_silence:
+        bars = loop_bars
+        while bars > 1:
+            bars //= 2
+            n = bars_to_samples(bars, target_bpm, sr)
+            seg = full[:n]
+            if len(seg) == n and silence_fraction(seg, sr) <= max_silence:
+                out = np.tile(seg, (loop_bars // bars, 1)).astype(np.float32)
+                padded = 0
+                tiled = bars
+                break
 
     return out.astype(np.float32), {
         "detected_bpm": det_bpm,
         "stretch_rate": rate,
         "stretched": used_stretch,
         "kick_lock": round(lock, 3) if align is True else None,
+        "first_kick_s": round(start / sr, 3),
+        "tiled_bars": tiled,
         "padded_samples": padded,
         "padded_seconds": round(padded / sr, 3),
     }
