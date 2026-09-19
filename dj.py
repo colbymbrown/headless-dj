@@ -370,6 +370,10 @@ def build_mix(slots, args, out_path):
         cfg = fx.DEFAULTS
         y = fx.fx(y, loops, bpms, slots, args.xfade_bars, cfg=cfg)
         y = fx.loudness(y, cfg)
+    if args.lowcut > 0 or args.highcut > 0:
+        print(f"band limiting: low cut {args.lowcut or 'off'} Hz, "
+              f"high cut {args.highcut or 'off'} Hz", flush=True)
+        y = mix.band_limit(y, SR, args.lowcut or None, args.highcut or None)
     sf.write(out_path, y, SR)
     return y, report
 
@@ -389,6 +393,12 @@ def main():
     ap.add_argument("--steps", type=int, default=100, help="diffusion steps (25 fast, 100 default)")
     ap.add_argument("--guidance", type=float, default=7.0)
     ap.add_argument("--loop-dbfs", type=float, default=-18.0)
+    ap.add_argument("--lowcut", type=float, default=32.0,
+                    help="high-pass the mix at this Hz to remove boomy sub "
+                         "bass (0 disables)")
+    ap.add_argument("--highcut", type=float, default=16000.0,
+                    help="low-pass the mix at this Hz to remove sibilance/"
+                         "distortion artifacts (0 disables)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--loops-dir", default="loops")
     ap.add_argument("--mix-only", action="store_true", help="reuse cached loops, no GPU")

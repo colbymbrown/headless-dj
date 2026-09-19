@@ -298,6 +298,20 @@ def fade_edges(y, sr, bpm, fade_in_bars, fade_out_bars):
     return y
 
 
+def band_limit(y, sr, low_hz=32.0, high_hz=16000.0):
+    """High-pass the boomy, non-musical sub and low-pass harsh sibilance /
+    distortion artifacts. 4th-order Butterworth, zero-phase (sosfiltfilt).
+    Set low_hz/high_hz to 0 (or None) to skip that edge."""
+    ny = sr / 2
+    if low_hz and low_hz > 0:
+        y = sosfiltfilt(butter(4, low_hz / ny, btype="high", output="sos"),
+                        y, axis=0).astype(np.float32)
+    if high_hz and high_hz > 0 and high_hz < ny:
+        y = sosfiltfilt(butter(4, high_hz / ny, btype="low", output="sos"),
+                        y, axis=0).astype(np.float32)
+    return y
+
+
 def finalize(y, peak=0.89):
     """Peak-normalize the finished mix to about -1 dBFS."""
     p = np.abs(y).max()
