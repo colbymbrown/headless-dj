@@ -222,7 +222,8 @@ def loop_path(slot, loops_dir, args):
 
     Includes the gene id (gene text is immutable per id) plus --steps,
     --guidance and the transform strength + previous loop's seed: they all
-    change the audio, so they are part of the cache key.
+    change the audio, so they are part of the cache key. a<N> = trim/anchor
+    logic version (img2img conds depend on how the parent was trimmed).
     """
     ts = slot.strength if slot.strength is not None else args.transform_strength
     xf = (f"_x{ts:g}"
@@ -230,7 +231,7 @@ def loop_path(slot, loops_dir, args):
           if args.transform_strength > 0 else "")
     return Path(loops_dir) / (
         f"gene{slot.gene_id}_{slug(slot.gene_text.split(',')[0])}_{int(round(slot.bpm))}"
-        f"_{slot.seed}_s{args.steps}_g{args.guidance:g}{xf}.flac")
+        f"_{slot.seed}_s{args.steps}_g{args.guidance:g}{xf}_a2.flac")
 
 
 def img2img_loop(pipe, torch, slot, args, cond_loop):
@@ -291,8 +292,11 @@ def img2img_loop(pipe, torch, slot, args, cond_loop):
     return audio[0, :, : int(slot.gen_seconds * SR)].T.float().cpu().numpy()
 
 
-def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot):
-    """Generate (or reuse) a slot's raw loop. -> (path, reused).
+def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot, prev_prepared=None):
+    """Generate (or reuse) a slot's raw loop. -> (path, reused, prepared).
+
+    prev_prepared: the previous slot's prepared loop -- both the img2img
+    condition and the child's trim anchor (see mix._chain_start).
 
     With --transform-strength and a previous slot, the loop is a whole-loop
     transform of the previous prepared loop instead of a fresh text-to-audio
@@ -311,14 +315,8 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot):
         fresh = not (path.exists() and not args.no_cache)
         if fresh:
             gen = torch.Generator("cuda").manual_seed(slot.seed)
-            if args.transform_strength > 0 and prev_slot is not None:
-                raw_prev, sr = sf.read(prev_slot.path, dtype="float32", always_2d=True)
-                cond, _ = mix.prepare_loop(raw_prev, sr, prev_slot.bpm, args.loop_bars,
-                                           stretch=not args.no_stretch,
-                                           align="onset" if args.onset_trim
-                                           else not args.no_align,
-                                           max_silence=args.max_silence)
-                cond = mix.rms_normalize(cond)
+            if args.transform_strength > 0 and prev_prepared is not None:
+                cond = mix.rms_normalize(prev_prepared.copy())
                 wav = img2img_loop(pipe, torch, slot, args, cond)
             else:
                 audio = pipe(slot.prompt, negative_prompt=NEGATIVE,
@@ -330,14 +328,15 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot):
         raw, sr = sf.read(path, dtype="float32", always_2d=True)
         loop, info = mix.prepare_loop(raw, sr, slot.bpm, args.loop_bars,
                                       stretch=not args.no_stretch,
-                                      max_silence=args.max_silence)
+                                      max_silence=args.max_silence,
+                                      align_ref=prev_prepared)
         frac = mix.silence_fraction(loop, SR)
-        intro = info.get("first_kick_s") or 0.0
+        intro = info.get("first_beat_s") or 0.0
         score = (intro > args.max_intro, frac)
         if best is None or score < best[0]:
             best = (score, slot.seed)
         if frac <= args.max_silence and intro <= args.max_intro:
-            return path, not fresh
+            return path, not fresh, loop
         if intro > args.max_intro:
             print(f"  ! [{slot.index}] rejected: {intro:.1f}s kickless intro "
                   f"(> {args.max_intro:.0f}s), retrying with seed {slot.seed + 100000}",
@@ -351,23 +350,29 @@ def generate_slot(pipe, torch, slot, args, loops_dir, prev_slot):
     slot.path = str(loop_path(slot, loops_dir, args))
     print(f"  ! [{slot.index}] all {args.silence_attempts} attempts rejected; "
           f"keeping best", flush=True)
-    return slot.path, False
+    return slot.path, False, loop
 
 
 # ------------------------------------------------------------------- mixin ---
 
 def build_mix(slots, args, out_path):
     loops, bpms, report = [], [], []
+    prev_prepared = None
     for s in slots:
         raw, sr = sf.read(s.path, dtype="float32", always_2d=True)
         info = {}
         if sr != SR:
             raise SystemExit(f"{s.path}: expected {SR}Hz, got {sr}Hz")
+        if args.onset_trim or args.no_align:
+            align = "onset" if args.onset_trim else False
+        else:
+            align = True
         loop, info = mix.prepare_loop(raw, sr, s.bpm, args.loop_bars,
                                       stretch=not args.no_stretch,
-                                      align="onset" if args.onset_trim
-                                      else not args.no_align,
+                                      align=align,
+                                      align_ref=prev_prepared if align is True else None,
                                       max_silence=args.max_silence)
+        prev_prepared = loop
         loops.append(mix.rms_normalize(loop, args.loop_dbfs))
         bpms.append(s.bpm)
         report.append({**asdict(s), **{k: (None if v is None else round(float(v), 4))
@@ -481,11 +486,14 @@ def main():
     if not args.mix_only:
         pipe, torch = load_pipe()
         prev_slot = None
+        prev_prepared = None
         for s in slots:
-            _, reused = generate_slot(pipe, torch, s, args, loops_dir, prev_slot)
+            _, reused, prep = generate_slot(pipe, torch, s, args, loops_dir,
+                                            prev_slot, prev_prepared)
             print(f"  [{s.index:3d}] {'reused' if reused else 'generated'} {s.path} "
                   f"({time.time() - t0:.0f}s elapsed)", flush=True)
             prev_slot = s
+            prev_prepared = prep
         trial["plays"] += 1  # a real render counts as a trial
         genes.save(pool)
     else:

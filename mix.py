@@ -1,7 +1,7 @@
 """Pure DSP for the DJ mixer. No torch here on purpose, so blends can be
 re-rendered from cached loops in seconds without touching the GPU."""
 import numpy as np
-from scipy.signal import butter, sosfilt, sosfiltfilt
+from scipy.signal import butter, sosfilt, sosfiltfilt, fftconvolve
 
 SR = 44100
 BEATS_PER_BAR = 4
@@ -102,48 +102,106 @@ def first_onset_time(oenv, hop, sr, thresh_frac=0.1, max_search_s=2.0):
     return 0
 
 
-# BeatNet's beat TIMES are frame-accurate, but its downbeat PHASE proved
-# unreliable on generated material (systematically ~2 beats off on clicks,
-# inconsistent across an img2img chain) -- and measured kick grids are
-# near-perfect (468.2ms spacing, 1.4ms sd). So the mixer anchors on kicks.
+def refine_beats(beats, oenv, hop):
+    """Snap each beat frame to the nearest onset-envelope peak.
 
-
-def kick_grid(mono, sr, bpm):
-    """(times, lock 0..1) of the dominant low-band onset grid.
-
-    ponytail: single 120 Hz band, strength-weighted phase cluster. Revisit if
-    a genre with syncopated kicks (breaks, DnB) joins the corpus.
+    beat_track returns frames on the hop grid (11.6 ms at hop 512), which is
+    visible as anchor jitter when warping. Parabolic peak on the envelope
+    removes the grid quantization.
     """
-    low = np.abs(sosfilt(butter(4, 120.0 / (sr / 2), btype="low", output="sos"),
-                         mono))
-    d = np.maximum(np.diff(low), 0.0)
-    w = int(0.02 * sr)
-    k = np.hanning(w)
-    k /= k.sum()
-    d = np.convolve(d, k, "same")
-    pk = np.where((d[1:-1] > d[:-2]) & (d[1:-1] >= d[2:])
-                  & (d[1:-1] > 0.25 * d.max()))[0] + 1
-    if not len(pk):
-        return np.array([]), 0.0
-    period = 60.0 / bpm
-    t, s = pk / sr, d[pk]
-    # merge double triggers within half a beat
-    mt, ms = [t[0]], [s[0]]
-    for x, y in zip(t[1:], s[1:]):
-        if x - mt[-1] > 0.4 * period:
-            mt.append(x)
-            ms.append(y)
-        elif y > ms[-1]:
-            ms[-1] = y
-    t, s = np.asarray(mt), np.asarray(ms)
-    # keep the strongest phase cluster: kicks, not stray off-beat bass notes
-    best_m, best_score = None, -1.0
-    for c in t:
-        m = np.abs((t - c + period / 2) % period - period / 2) < 0.15 * period
-        if s[m].sum() > best_score:
-            best_m, best_score = m, s[m].sum()
-    return t[best_m], float(best_m.sum() / len(t))
+    out = []
+    n = len(oenv)
+    for b in beats:
+        i = int(round(b))
+        lo, hi = max(0, i - 4), min(n, i + 5)
+        w = oenv[lo:hi]
+        if len(w) < 3:
+            out.append(b)
+            continue
+        k = lo + int(np.argmax(w))
+        if 1 <= k - lo < len(w) - 1:  # parabolic sub-frame peak
+            a, c0, c1 = w[k - lo - 1], w[k - lo], w[k - lo + 1]
+            denom = a - 2 * c0 + c1
+            if denom != 0:
+                k += 0.5 * (a - c1) / denom
+        out.append(k)
+    return np.asarray(out, dtype=float)
 
+
+def _mono(x):
+    return x.mean(axis=1) if x.ndim > 1 else x
+
+
+def _chain_start(parent, child, sr, bpm, loop_bars):
+    """Trim sample offset for a chain child: where the parent's downbeat
+    landed in this generation.
+
+    Each img2img transform shifts the whole groove by its own constant offset
+    (measured 0..0.7 beat, constant over the loop), so the only reliable
+    anchor is the parent itself: correlate its prepared downbeat against the
+    child's onset envelope, then nudge until the blend window (parent's last
+    4 bars vs child's first 4) is aligned -- a beatmatch-and-nudge, accepted
+    only when it lands within 60 ms of perfect.
+
+    ponytail: 2-beat reference / 3-beat search; revisit if intro-heavy
+    generations grow beyond that.
+    """
+    import librosa
+    hop = 512
+    fps = sr / hop
+    ce = librosa.onset.onset_strength(y=_mono(child), sr=sr, hop_length=hop)
+    if parent is None:
+        _, beats = librosa.beat.beat_track(onset_envelope=ce, sr=sr,
+                                           hop_length=hop, units="frames",
+                                           start_bpm=bpm)
+        beats = np.atleast_1d(beats)
+        return int(beats[0]) * hop if len(beats) else 0
+    pe = librosa.onset.onset_strength(y=_mono(parent), sr=sr, hop_length=hop)
+    k = min(len(pe), int(2 * 60 / bpm * fps))
+    seg = ce[:min(len(ce), int(3 * 60 / bpm * fps))].astype(np.float64)
+    re = pe[:k].astype(np.float64)
+    re -= re.mean()
+    if len(seg) <= k:
+        return 0
+    c = fftconvolve(seg, re[::-1], mode="full")[k - 1:][:len(seg) - k + 1]
+    csum = np.convolve(seg * seg, np.ones(k), "valid")[:len(c)]
+    start = int(np.argmax(c / np.sqrt(np.maximum(csum, 1e-9) * (re * re).sum()))) * hop
+
+    # blend-window nudge: parent's last 4 bars vs candidate child's first 4
+    w = np.hanning(int(0.02 * sr))
+    w /= w.sum()
+    sos = butter(4, [300 / (sr / 2), 8000 / (sr / 2)], btype="band", output="sos")
+    def pulse(x):
+        d = np.convolve(np.maximum(np.diff(np.abs(sosfilt(sos, x[:, 0]))), 0), w, "same")
+        return d - d.mean()
+    def blend_lag(cand):
+        beat = 60.0 / bpm
+        a, b = pulse(parent), pulse(cand)
+        m = int(4 * beat * sr)
+        aa, bb = a[len(a) - m:], b[:m]
+        maxlag = int(0.75 * beat * sr)
+        cc = fftconvolve(aa, bb[::-1], mode="full")[m - 1 - maxlag:m - 1 + maxlag]
+        lag = (int(np.argmax(cc)) - maxlag) / sr
+        return ((lag / beat + 0.5) % 1 - 0.5) * beat
+    def trim(st):
+        want = bars_to_samples(loop_bars, bpm, sr)
+        body = child[st:st + want]
+        if len(body) < want:
+            body = np.pad(body, ((0, want - len(body)), (0, 0)))
+        return body.astype(np.float32)
+    cand = trim(start)
+    for _ in range(2):
+        lag = blend_lag(cand)
+        if abs(lag) <= 0.06:
+            break
+        st2 = max(0, start - int(lag * sr))
+        cand2 = trim(st2)
+        lag2 = blend_lag(cand2)
+        if abs(lag2) < abs(lag) and abs(lag2) <= 0.06:
+            start, cand = st2, cand2
+        else:
+            break
+    return start
 
 
 def resample_time(y, rate):
@@ -160,17 +218,17 @@ def resample_time(y, rate):
 
 
 def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True,
-                 max_silence=None):
+                 max_silence=None, align_ref=None):
     """Raw generation -> exactly `loop_bars` of beat-locked audio.
 
-    align: True = kick-grid downbeat (trim at the first kick of the dominant
-    low-band onset grid), "onset" = first strong onset, False = t=0.
+    align: True = trim at the first beat of the broadband pulse, "onset" =
+    first strong onset, False = t=0.
 
-    Kick-grid anchoring: an img2img chain drifts each child's groove by
-    ~0.1-0.3 beats, so per-loop trims must re-anchor to each loop's own grid.
-    The grid's first kick is the downbeat by chain construction (children start
-    on their parent's prepared downbeat) -- cutting on ANY grid kick kills the
-    flam; cutting on the first keeps bar phase chain-consistent.
+    align_ref: the parent loop's PREPARED audio. Each img2img transform shifts
+    the whole groove by its own constant offset (0..0.7 beat), so for chain
+    children the trim is found by locating the parent's downbeat in this
+    generation (see _chain_start) -- per-loop beat grids cannot do it, and
+    low-band kick grids don't even exist on some genres (melodic techno).
 
     Silence fallback (max_silence): if the trimmed loop is more than this
     fraction silent, tile the longest silence-free power-of-2 prefix instead
@@ -205,24 +263,29 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True,
             "detected_bpm": None, "stretch_rate": 1.0, "stretched": False,
             "stretched": False, "padded_samples": padded,
             "padded_seconds": round(padded / sr, 3),
-            "first_kick_s": 0.0,
+            "first_beat_s": 0.0,
         }
     det_bpm, beats, oenv, hop = analyze_timing(mono, sr, target_bpm)
     rate = target_bpm / det_bpm if (det_bpm and stretch) else 1.0
     padded = 0
     used_stretch = False
 
-    # Trim on the loop's own kick grid: phase-locks the blend no matter how
-    # far the transform chain drifted. The trim must land exactly on a kick
-    # onset; anything else flams.
+    # Trim at the first beat of the broadband pulse. The broadband onset
+    # envelope has a strong 1-beat periodicity on all corpus genres, while
+    # the LOW band alone does not (melodic techno's rolling bass has no kick
+    # grid to find -- measured: low-band autocorrelation ~ 0). beat_track's
+    # global phase optimization is therefore the reliable anchor; the trim
+    # must land on the pulse, anything else flams.
     if align == "onset":
         start = first_onset_time(oenv, hop, sr)
+    elif align_ref is not None:
+        start = _chain_start(align_ref, raw, sr, target_bpm, loop_bars)
     else:
-        kicks, lock = kick_grid(mono, sr, det_bpm or target_bpm)
-        if not len(kicks):
-            raise SystemExit("no kick onsets found in loop; cannot beat-align "
+        if not len(beats):
+            raise SystemExit("no pulse found in loop; cannot beat-align "
                              "(rerun with a bumped seed)")
-        start = int(kicks[0] * sr)
+        beats = refine_beats(beats, oenv, hop)
+        start = int(beats[0] * hop)
     body = raw[start:]  # source audio from the downbeat on
 
     # Constant-tempo stretch, only when the rate is sane (else it's a tracker error)
@@ -269,8 +332,7 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True,
         "detected_bpm": det_bpm,
         "stretch_rate": rate,
         "stretched": used_stretch,
-        "kick_lock": round(lock, 3) if align is True else None,
-        "first_kick_s": round(start / sr, 3),
+        "first_beat_s": round(start / sr, 3),
         "tiled_bars": tiled,
         "padded_samples": padded,
         "padded_seconds": round(padded / sr, 3),
