@@ -14,10 +14,13 @@ BASS_SWAP_BEATS = 2.0  # how fast the low end hands over, once, mid-blend
 # if blends still feel muddy, or a mid-band duck to stop two basslines fighting.
 _SOS = butter(4, CROSSOVER_HZ / (SR / 2), btype="low", output="sos")
 
-# Max stretch factor: beyond this we suspect a beat-tracker error and fall back
-# to simple resampling (pitch shifts are acceptable there since it's a last resort).
-_MAX_STRETCH = 1.5   # e.g. detected 90 BPM when asked for 128 → ~43% stretch
-_MIN_STRETCH = 1.0 / _MAX_STRETCH  # ~0.67
+# Max stretch factor: beyond this we suspect a beat-tracker error and fall
+# back to simple resampling (pitch shifts are acceptable there since it's a last resort).
+# ±8% is the sane band: the model is asked for the target BPM and usually
+# lands within a few percent; anything beyond that is a tracker octave-near
+# miss (e.g. 110 detected for 137 actual) that would sound sped up/slowed down.
+_MAX_STRETCH = 1.08
+_MIN_STRETCH = 1.0 / _MAX_STRETCH
 
 
 def sec_per_bar(bpm):
