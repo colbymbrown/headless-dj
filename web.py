@@ -51,7 +51,7 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8"><meta name="viewport"
 <style>
 body {{ font-family: sans-serif; max-width: 760px; margin: 2em auto; padding: 0 12px; box-sizing: border-box; background: #111; color: #ddd; }}
 .row {{ display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid #333; }}
-.vmsg {{ display: block; color: #7c7; font-size: 0.85em; }}
+.vmsg {{ display: block; color: #7c7; font-size: 0.85em; word-wrap: break-word; overflow-wrap: break-word; }}
 .row div {{ flex: 1; min-width: 0; }} audio {{ width: 340px; }}
 button {{ font-size: 1.6em; background: none; border: none; cursor: pointer; padding: 4px 10px; -webkit-tap-highlight-color: transparent; }}
 button:hover {{ transform: scale(1.2); }} small {{ color: #888; word-wrap: break-word; }}
