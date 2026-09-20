@@ -309,6 +309,13 @@ def prepare_loop(raw, sr, target_bpm, loop_bars, stretch=True, align=True,
         start = int(beats[0] * hop)
     body = raw[start:]  # source audio from the downbeat on
 
+    # If the detected tempo is outside the sane stretch band, treat it as a
+    # beat-tracker octave error and trust the prompt tempo (no stretch).
+    # Otherwise a 2x-detected tempo yields rate=0.5, the rubberband guard
+    # skips it, but the resample fallback below still applies it -> half-speed.
+    if stretch and not (_MIN_STRETCH <= rate <= _MAX_STRETCH):
+        rate = 1.0
+
     # Constant-tempo stretch, only when the rate is sane (else it's a tracker error)
     # and the clip is long enough that stretching won't run past its end.
     full = None
