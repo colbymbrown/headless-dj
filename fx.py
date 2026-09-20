@@ -28,8 +28,8 @@ BEATS_PER_BAR = mix.BEATS_PER_BAR
 
 DEFAULTS = {
     "p_echo": 0.25,
-    "p_reverb": 0.15,
-    "reverb_before_key_change": True,
+    "p_reverb": 0.01,
+    "reverb_before_key_change": False,
     "phaser_prob": 0.02,
     "echo_out_bars": 1.0,
     "rhythm_pool": {1.0: 3, 0.75: 2, 3.0: 1, 1.5: 2},
