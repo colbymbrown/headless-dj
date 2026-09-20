@@ -130,7 +130,16 @@ class Slot:
 
     @property
     def prompt(self):
-        return (f"{int(round(self.bpm))} BPM loop, {self.gene_text}, "
+        clauses = self.gene_text.split(", ")
+        # Rotate clause order per slot so the transformer's positional bias
+        # (earlier tokens weighted more) cycles through all parts of the
+        # prompt. Prevents the img2img chain from fixating on one element
+        # (e.g. hi-hats) while ignoring bass/chords/melody.
+        if len(clauses) > 1:
+            r = self.index % len(clauses)
+            clauses = clauses[r:] + clauses[:r]
+        gene = ", ".join(clauses)
+        return (f"{int(round(self.bpm))} BPM loop, {gene}, "
                 f"stereo club mix, instrumental")
 
 
