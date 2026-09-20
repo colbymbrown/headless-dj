@@ -141,9 +141,9 @@ def _schedule_events(m, cfg, rng, total, bar):
     for s in m["transitions"]:
         if far(s) and rng.random() < cfg["p_echo"]:
             events.append(("echo", s)); last = s
-    # reverb before every key change + at a fraction of transitions
+    # reverb before key change (if enabled) + rare on transitions
     for s in m["key_changes"]:
-        if far(s):
+        if cfg.get("reverb_before_key_change", False) and far(s):
             events.append(("reverb", s)); last = s
     for s in m["transitions"]:
         if far(s) and rng.random() < cfg["p_reverb"]:
