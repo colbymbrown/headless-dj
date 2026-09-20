@@ -3,6 +3,8 @@ re-rendered from cached loops in seconds without touching the GPU."""
 import numpy as np
 from scipy.signal import butter, sosfilt, sosfiltfilt, fftconvolve
 
+from pedalboard import Compressor
+
 SR = 44100
 BEATS_PER_BAR = 4
 CROSSOVER_HZ = 180.0  # bass-swap crossover
@@ -480,6 +482,36 @@ def fade_edges(y, sr, bpm, fade_in_bars, fade_out_bars):
         t = np.linspace(0, np.pi / 2, n_out, dtype=np.float32)
         y[-n_out:] *= np.cos(t)[:, None]
     return y
+
+
+def multiband_compress(y, sr, cfg=None):
+    """3-band compressor: tame per-band dynamics so no single frequency
+    range jumps out unnaturally. Split at 200 Hz / 3 kHz (Linkwitz-Riley
+    crossovers, zero-phase), compress each band, sum. Applied per-loop before
+    normalization so hot bass or harsh highs are controlled before mixing."""
+    if cfg is None:
+        cfg = _MBC_DEFAULTS
+    ny = sr / 2
+    lo_lp = butter(4, cfg["xover_lo"] / ny, btype="low", output="sos")
+    mid_hp = butter(4, cfg["xover_lo"] / ny, btype="high", output="sos")
+    mid_lp = butter(4, cfg["xover_hi"] / ny, btype="low", output="sos")
+    hi_hp = butter(4, cfg["xover_hi"] / ny, btype="high", output="sos")
+    lo = sosfiltfilt(lo_lp, y, axis=0)
+    mid = sosfiltfilt(mid_lp, sosfiltfilt(mid_hp, y, axis=0), axis=0)
+    hi = sosfiltfilt(hi_hp, y, axis=0)
+    lo = np.asarray(Compressor(**cfg["lo"])(lo, sr), dtype=np.float32)
+    mid = np.asarray(Compressor(**cfg["mid"])(mid, sr), dtype=np.float32)
+    hi = np.asarray(Compressor(**cfg["hi"])(hi, sr), dtype=np.float32)
+    return (lo + mid + hi).astype(np.float32)
+
+
+_MBC_DEFAULTS = {
+    "xover_lo": 200.0,
+    "xover_hi": 3000.0,
+    "lo":  {"threshold_db": -18.0, "ratio": 3.0, "attack_ms": 10.0, "release_ms": 150.0},
+    "mid": {"threshold_db": -20.0, "ratio": 2.0, "attack_ms": 8.0,  "release_ms": 120.0},
+    "hi":  {"threshold_db": -22.0, "ratio": 2.5, "attack_ms": 5.0,  "release_ms": 80.0},
+}
 
 
 def band_limit(y, sr, low_hz=32.0, high_hz=16000.0):

@@ -380,6 +380,7 @@ def build_mix(slots, args, out_path):
                                       align_ref=prev_prepared if align is True else None,
                                       max_silence=args.max_silence)
         prev_prepared = loop
+        loop = mix.multiband_compress(loop, sr)
         loops.append(mix.rms_normalize(loop, args.loop_dbfs))
         bpms.append(s.bpm)
         report.append({**asdict(s), **{k: (None if v is None else round(float(v), 4))
