@@ -38,8 +38,6 @@ DEFAULTS = {
     "reverb_wet": 0.28,
     "reverb_input_bars": 2.0,
     "reverb_room": 0.5,
-    "reverb_damping": 0.5,
-    "reverb_width": 1.0,
     "phaser_wet": 0.30,
     "phaser_rate": 0.4,
     "target_lufs": -14.0,
@@ -199,18 +197,12 @@ def _reverb(y, s, cfg, rng, bar):
     # the reverb (reset=False so state persists), then flush with silence so
     # it rings out naturally. The wet signal is faded in over the first bar to
     # smooth the onset and mixed back at wet_level as the return.
-    # Params are jittered per hit so no two reverbs sound identical.
-    room = _jitter(cfg["reverb_room"], rng, 0.08, 0.1, 0.9)
-    damping = _jitter(cfg.get("reverb_damping", 0.5), rng, 0.15, 0.1, 0.9)
-    width = _jitter(cfg.get("reverb_width", 1.0), rng, 0.2, 0.1, 1.0)
-    wet_lvl = _jitter(cfg["reverb_wet"], rng, 0.15, 0.1, 0.5)
-    in_bars = _jitter(cfg.get("reverb_input_bars", 2.0), rng, 0.2, 1.0, 3.0)
+    in_bars = max(0.5, cfg.get("reverb_input_bars", 2.0))
     seg = y[max(0, s - int(in_bars * bar)):s]
     if seg.shape[0] < SR * 0.1:
         return None
     hp = _highpass_seg(seg)
-    effect = Reverb(room_size=room, damping=damping, width=width,
-                    wet_level=1.0, dry_level=0.0)
+    effect = Reverb(room_size=cfg["reverb_room"], wet_level=1.0, dry_level=0.0)
     wet = _ring_tail(effect, hp)  # send + flush -> ringing tail
     wet = wet[: y.shape[0] - s]
     if wet.shape[0] == 0:
@@ -221,7 +213,7 @@ def _reverb(y, s, cfg, rng, bar):
         wet[:fade_n] *= np.linspace(0.0, 1.0, fade_n)[:, None]
     out = y.copy()
     end = min(y.shape[0], s + wet.shape[0])
-    out[s:end] += wet_lvl * wet[: end - s]
+    out[s:end] += cfg["reverb_wet"] * wet[: end - s]
     return out
 
 
