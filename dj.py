@@ -21,10 +21,12 @@ import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 
 import mix
 import genes
+import vram
 
 # Ignore the benign float64-epsilon time-boundary warnings from
 # torchsde's Brownian sampler (tb=0.29999998 vs t0=0.3 at the
@@ -183,7 +185,9 @@ def make_plan(args):
         if want > MAX_GEN_S:
             print(f"  ! {bpm:.1f} BPM: {args.loop_bars} bars + preroll exceeds "
                   f"{MAX_GEN_S:.0f}s, generating {MAX_GEN_S:.0f}s", file=sys.stderr)
-        total += (args.loop_bars - args.xfade_bars) * bar_s
+        # each groove plays `plays` times before the next blends in, so a
+        # phrase establishes instead of vanishing after one pass.
+        total += (args.plays * args.loop_bars - args.xfade_bars) * bar_s
         i += 1
     # Slow LFO on the img2img transform strength: a sine with a 12-loop period
     # and +-0.2 depth around --transform-strength. High points stay close to the
@@ -216,6 +220,9 @@ def _key_iter(rng, loops_per_key):
 def load_pipe():
     import torch
     from diffusers import StableAudioPipeline
+
+    # Wait for GPU if another process is using it.
+    vram.wait_for_vram(target_gb=4.0, poll_s=5)
 
     print(f"loading {MODEL_ID} (first run downloads ~5GB)...", flush=True)
     pipe = StableAudioPipeline.from_pretrained(MODEL_ID, torch_dtype=torch.float16)
@@ -388,7 +395,8 @@ def build_mix(slots, args, out_path):
                                       align=align,
                                       align_ref=prev_prepared if align is True else None,
                                       max_silence=args.max_silence)
-        prev_prepared = loop
+        prev_prepared = loop  # single-copy: chain-alignment reference for the next loop
+        loop = np.tile(loop, (args.plays, 1))  # play each groove `plays` times before the blend
         loop = mix.multiband_compress(loop, sr)
         loops.append(mix.rms_normalize(loop, args.loop_dbfs))
         bpms.append(s.bpm)
@@ -439,18 +447,22 @@ def main():
     ap.add_argument("--loop-bars", type=int, default=8,
                     help="bars per loop (8 avoids the model's 8-bar-then-"
                          "dead-8 dropout that 16-bar requests produce)")
+    ap.add_argument("--plays", type=int, default=2,
+                    help="how many times each groove plays before the next "
+                         "loop blends in (EDM two-loop rule; 1 = old one-pass)")
     ap.add_argument("--xfade-bars", type=int, default=4)
     ap.add_argument("--fade-bars", type=int, default=8)
     ap.add_argument("--loops-per-key", type=int, default=4)
     ap.add_argument("--steps", type=int, default=100, help="diffusion steps (25 fast, 100 default)")
     ap.add_argument("--guidance", type=float, default=7.0)
     ap.add_argument("--loop-dbfs", type=float, default=-18.0)
-    ap.add_argument("--lowcut", type=float, default=32.0,
+    ap.add_argument("--lowcut", type=float, default=40.0,
                     help="high-pass the mix at this Hz to remove boomy sub "
-                         "bass (0 disables)")
-    ap.add_argument("--highcut", type=float, default=16000.0,
-                    help="low-pass the mix at this Hz to remove sibilance/"
-                         "distortion artifacts (0 disables)")
+                         "bass pressure (0 disables; 40 Hz tames the physical "
+                         "fatigue without cutting the bass fundamental)")
+    ap.add_argument("--highcut", type=float, default=14000.0,
+                    help="low-pass the mix at this Hz to remove metallic AI "
+                         "artifacts above this range (0 disables)")
     ap.add_argument("--out", default=None)
     ap.add_argument("--loops-dir", default="loops")
     ap.add_argument("--mix-only", action="store_true", help="reuse cached loops, no GPU")
@@ -529,6 +541,10 @@ def main():
 
     t0 = time.time()
     if not args.mix_only:
+        # Estimate VRAM needed for the longest generation and wait if GPU is busy.
+        max_gen_s = max(s.gen_seconds for s in slots)
+        need_gb = vram.estimate_stable_audio_vram(max_gen_s) / 1e9
+        print(f"VRAM estimate: ~{need_gb:.0f} GB for {max_gen_s:.0f}s generation", flush=True)
         pipe, torch = load_pipe()
         prev_slot = None
         prev_prepared = None

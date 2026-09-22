@@ -20,11 +20,30 @@ import numpy as np
 
 import mix
 from pedalboard import (Pedalboard, HighpassFilter, Delay, Reverb, Phaser,
-                        Compressor, Limiter)
+                        Compressor, Limiter, PeakFilter, HighShelfFilter)
 
 SR = mix.SR
 CROSSOVER_HZ = mix.CROSSOVER_HZ
 BEATS_PER_BAR = mix.BEATS_PER_BAR
+
+# Corrective EQ for AI-generated harshness. Stable Audio Open (and AI music
+# models generally) over-generate in the ear's most fatiguing resonance region
+# (2-8 kHz): metallic sheen around 5-8 kHz, harsh upper-mids around 2.5-3 kHz
+# (the ear canal resonates at ~3 kHz -- the tinnitus frequency). These surgical
+# cuts + a broad high-shelf tame it. See artefactfx.com AI-artifact guide.
+EQ_DEFAULTS = {
+    "shelf_hz": 3000.0,    # broad cut above the ear-canal resonance
+    "shelf_db": -3.0,
+    "harsh_hz": 2500.0,    # harsh upper-mid resonance AI models produce
+    "harsh_db": -2.0,
+    "harsh_q": 1.5,
+    "sibil_hz": 5000.0,    # metallic sibilance
+    "sibil_db": -2.0,
+    "sibil_q": 1.5,
+    "metal_hz": 8000.0,    # digital/metallic artifacts
+    "metal_db": -2.0,
+    "metal_q": 2.0,
+}
 
 DEFAULTS = {
     "p_echo": 0.25,
@@ -40,7 +59,7 @@ DEFAULTS = {
     "reverb_room": 0.5,
     "phaser_wet": 0.30,
     "phaser_rate": 0.4,
-    "target_lufs": -14.0,
+    "target_lufs": -15.0,   # quieter than streaming-hot -14; less ear fatigue
     "limiter_ceiling": 0.92,
     "comp_threshold_db": -16.0,
     "comp_ratio": 2.0,
@@ -232,10 +251,30 @@ def _phaser(y, s, cfg):
 
 # -------------------------------------------------------------- loudness ---
 
+def corrective_eq(y, sr, cfg=None):
+    """Tame AI-generated harshness before the loudness chain. Surgical peak cuts
+    at the frequencies AI music models over-generate (the ear's resonance
+    region, 2-8 kHz) plus a broad high-shelf above 3 kHz."""
+    cfg = cfg if cfg is not None else EQ_DEFAULTS
+    board = Pedalboard([
+        HighShelfFilter(cutoff_frequency_hz=cfg["shelf_hz"],
+                        gain_db=cfg["shelf_db"]),
+        PeakFilter(cutoff_frequency_hz=cfg["harsh_hz"],
+                   gain_db=cfg["harsh_db"], q=cfg["harsh_q"]),
+        PeakFilter(cutoff_frequency_hz=cfg["sibil_hz"],
+                   gain_db=cfg["sibil_db"], q=cfg["sibil_q"]),
+        PeakFilter(cutoff_frequency_hz=cfg["metal_hz"],
+                   gain_db=cfg["metal_db"], q=cfg["metal_q"]),
+    ])
+    return np.asarray(board(y, sr), dtype=np.float32)
+
+
 def loudness(y, cfg=None):
-    """Master bus: gain match -> glue compressor -> true-peak limiter.
-    Run LAST (post-fx)."""
+    """Master bus: corrective EQ -> gain match -> glue compressor -> true-peak
+    limiter. Run LAST (post-fx)."""
     cfg = cfg if cfg is not None else DEFAULTS
+    # 0. tame AI artifacts before anything else hears them
+    y = corrective_eq(y, SR, cfg.get("eq"))
     # 1. gain match to target loudness
     rms = float(np.sqrt(np.mean(y ** 2)))
     rms_db = 20.0 * np.log10(rms + 1e-9)
